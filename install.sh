@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 5.1: Исправлена ошибка KeyError в subkeen_multi.py
+# Версия 5.2: Добавлена остановка Xray перед обновлением (fix Text file busy)
 # ============================================================
 set -e
 
@@ -9,7 +9,7 @@ set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v5.1"
+echo "  XKeen + SubKeen Auto-Install v5.2"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -69,6 +69,10 @@ done
 # ===== [4/13] XRAY =====
 echo ""
 echo "[4/13] Установка Xray..."
+# Останавливаем запущенный Xray, чтобы избежать ошибки "Text file busy" при распаковке
+killall xray 2>/dev/null || true
+sleep 1
+
 cd /tmp
 XRAY_VER="v26.9.30"
 if ! curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-$XRAY_ARCH.zip"; then
@@ -123,7 +127,7 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py (ИСПРАВЛЕНА ОШИБКА KeyError) =====
+# ===== [8/13] subkeen_multi.py =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
