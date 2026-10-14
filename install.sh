@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 5.0: Использует оригинальные конфиги XKeen
+# Версия 5.1: Исправлена ошибка KeyError в subkeen_multi.py
 # ============================================================
 set -e
 
@@ -9,7 +9,7 @@ set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v5.0"
+echo "  XKeen + SubKeen Auto-Install v5.1"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -123,7 +123,7 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py (из инструкции) =====
+# ===== [8/13] subkeen_multi.py (ИСПРАВЛЕНА ОШИБКА KeyError) =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
@@ -294,7 +294,14 @@ def main():
                 src = f if i == 1 else "%s.%d" % (f, i-1)
                 dst = "%s.%d" % (f, i)
                 if os.path.exists(src): shutil.copy2(src, dst)
+    
+    # ИСПРАВЛЕНИЕ: Защита от KeyError, если в файле нет ключа "outbounds"
     ob = load_jsonc(OB)
+    if isinstance(ob, list):
+        ob = {"outbounds": ob}
+    if "outbounds" not in ob:
+        ob["outbounds"] = []
+        
     ob["outbounds"] = [o for o in ob["outbounds"] if not str(o.get("tag","")).startswith(("proxy-","excl-","priority-"))]
     n_excl = n_pri = n_proxy = 0
     for i, u in enumerate(urls):
@@ -359,7 +366,7 @@ PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 echo "  Создан"
 
-# ===== [9/13] choose (из инструкции) =====
+# ===== [9/13] choose =====
 echo ""
 echo "[9/13] Создание команды choose..."
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
