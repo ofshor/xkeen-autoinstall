@@ -1,12 +1,15 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 3.0: Smart Caching, choose, безопасные init, очистка
+# Версия 3.1: Исправлены все ошибки (CRLF, iptables, xkeen restart, cron)
 # ============================================================
 set -e
 
+# АВТОЛЕЧЕНИЕ: Убираем Windows-окончания строк (\r), если они попали при скачивании
+sed -i 's/\r$//' "$0" 2>/dev/null || true
+
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v3.0"
+echo "  XKeen + SubKeen Auto-Install v3.1"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -46,7 +49,7 @@ echo "  Выбрано: $XRAY_ARCH"
 echo ""
 echo "[3/13] Установка пакетов..."
 opkg update >/dev/null 2>&1 || true
-for pkg in python3 curl; do
+for pkg in python3 curl iptables; do
     printf "  -> %-10s " "$pkg"
     if opkg list-installed 2>/dev/null | grep -q "^$pkg "; then
         echo "[уже установлен]"
@@ -82,69 +85,47 @@ tar -xzf xkeen.tar.gz -C /opt/ >/dev/null
 rm -f xkeen.tar.gz
 chmod +x /opt/xkeen
 ln -sf /opt/xkeen /opt/bin/xkeen
-cp -r /opt/_xkeen /opt/sbin/.xkeen
+# КРИТИЧЕСКИ ВАЖНО: Создаем симлинк для внутренней папки XKeen, чтобы работал xkeen -restart
+ln -sfn /opt/_xkeen /opt/bin/.xkeen
 echo "  XKeen установлен"
 
 # ===== [6/13] КОНФИГИ XRAY =====
 echo ""
-echo "[6/13] Создание конфигов Xray (без geosite_v2fly)..."
+echo "[6/13] Создание конфигов Xray..."
 mkdir -p /opt/etc/xray/configs
-cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/
+cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/ 2>/dev/null || true
 touch /opt/etc/xray/geoip.dat /opt/etc/xray/geosite.dat
+
+# Принудительно создаем рабочие DNS и Outbounds, чтобы xray -test не падал
+cat > /opt/etc/xray/configs/02_dns.json << 'DNS_EOF'
+{
+  "dns": {
+    "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+  }
+}
+DNS_EOF
+
+cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
+{
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"},
+    {"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": 443, "users": [{"id": "00000000-0000-0000-0000-000000000000", "encryption": "none"}]}]}, "streamSettings": {"network": "tcp", "security": "none"}, "tag": "proxy-00"}
+  ]
+}
+OB_EOF
 
 cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
 {
   "routing": {
     "rules": [
-      {
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "block",
-        "type": "field",
-        "network": "udp",
-        "port": "135, 137, 138, 139"
-      },
-      {
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "block",
-        "type": "field",
-        "domain": ["appcenter.ms"]
-      },
-      {
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "direct",
-        "type": "field",
-        "domain": [
-          "regexp:^([\\w\\-\\.]+\\.)ru$",
-          "regexp:^([\\w\\-\\.]+\\.)su$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$",
-          "regexp:^([\\w\\-\\.]+\\.)moscow$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"
-        ]
-      },
-      {
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "direct",
-        "type": "field",
-        "protocol": ["bittorrent"]
-      },
-      {
-        "inboundTag": ["redirect", "tproxy"],
-        "balancerTag": "auto-balancer",
-        "type": "field"
-      }
+      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "type": "field", "network": "udp", "port": "135, 137, 138, 139"},
+      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "type": "field", "domain": ["appcenter.ms"]},
+      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "type": "field", "domain": ["regexp:^([\\w\\-\\.]+\\.)ru$", "regexp:^([\\w\\-\\.]+\\.)su$", "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$", "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$", "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$", "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$", "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$", "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$", "regexp:^([\\w\\-\\.]+\\.)moscow$", "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"]},
+      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "type": "field", "protocol": ["bittorrent"]},
+      {"inboundTag": ["redirect", "tproxy"], "balancerTag": "auto-balancer", "type": "field"}
     ],
-    "balancers": [
-      {
-        "tag": "auto-balancer",
-        "selector": ["proxy-"],
-        "strategy": { "type": "leastPing" }
-      }
-    ]
+    "balancers": [{"tag": "auto-balancer", "selector": ["proxy-"], "strategy": {"type": "leastPing"}}]
   }
 }
 ROUTING_EOF
@@ -161,39 +142,17 @@ echo ""
 echo "[7/13] Создание subkeen.conf.json..."
 cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 {
-  "subscription": {
-    "url": "",
-    "update_interval_hours": 1
-  },
-  "observatory": {
-    "probe_url": "http://cp.cloudflare.com/generate_204",
-    "probe_interval": "60s"
-  },
-  "balancer": {
-    "strategy": "leastLoad",
-    "expected_servers": 3,
-    "max_rtt": "2000ms",
-    "tolerance_percent": 50
-  },
-  "priority": {
-    "patterns": []
-  },
-  "exclusions": {
-    "by_flag": ["🇷🇺"],
-    "by_name": ["россия", "russia", "ru"],
-    "by_hostname": ["msk", "moscow", "cashgruz"],
-    "manual_ip_blacklist": []
-  },
-  "system": {
-    "log_level": "warning",
-    "auto_restart_on_fail": true,
-    "keep_backups": 3
-  }
+  "subscription": {"url": "", "update_interval_hours": 1},
+  "observatory": {"probe_url": "http://cp.cloudflare.com/generate_204", "probe_interval": "60s"},
+  "balancer": {"strategy": "leastLoad", "expected_servers": 3, "max_rtt": "2000ms", "tolerance_percent": 50},
+  "priority": {"patterns": []},
+  "exclusions": {"by_flag": ["🇷🇺"], "by_name": ["россия", "russia", "ru"], "by_hostname": ["msk", "moscow", "cashgruz"], "manual_ip_blacklist": []},
+  "system": {"log_level": "warning", "auto_restart_on_fail": true, "keep_backups": 3}
 }
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py =====
+# ===== [8/13] subkeen_multi.py (ИЗ ИНСТРУКЦИИ) =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py (Smart Caching)..."
 mkdir -p /opt/sbin/SubKeen-current
@@ -207,7 +166,6 @@ OB = "/opt/etc/xray/configs/04_outbounds.json"
 RT = "/opt/etc/xray/configs/05_routing.json"
 OBS = "/opt/etc/xray/configs/07_observatory.json"
 CONF_DIR = "/opt/etc/xray/configs"
-CRON_STORE = "/opt/etc/crontabs.subkeen"
 CACHE_TTL = 7 * 24 * 60 * 60
 
 def load_config():
@@ -414,6 +372,7 @@ def main():
                 bak = f + ".1"
                 if os.path.exists(bak): shutil.copy2(bak, f)
         sys.exit("Конфиг не прошёл тест")
+    # ШТАТНЫЙ ПЕРЕЗАПУСК ЧЕРЕЗ XKEEN (теперь работает благодаря симлинку .xkeen)
     subprocess.run(["xkeen", "-restart"], check=False)
     interval = cfg["subscription"].get("update_interval_hours", 1)
     p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
@@ -421,7 +380,6 @@ def main():
     lines.append("0 */%d * * * /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py # subkeen_cron" % interval)
     with open("/tmp/cron_subkeen.txt", "w") as f: f.write("\n".join(lines) + "\n")
     subprocess.run(["crontab", "/tmp/cron_subkeen.txt"], check=True)
-    shutil.copy("/tmp/cron_subkeen.txt", CRON_STORE)
     print("Готово. Cron каждые %d ч." % interval)
 
 if __name__ == "__main__": main()
@@ -429,7 +387,7 @@ PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 echo "  Создан"
 
-# ===== [9/13] choose =====
+# ===== [9/13] choose (ИЗ ИНСТРУКЦИИ, с исправленным форматированием) =====
 echo ""
 echo "[9/13] Создание команды choose..."
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
@@ -542,7 +500,7 @@ try:
     cur = config.get("balancer", {}).get("tolerance_percent", 50)
     print("\n" + "="*70)
     print("Текущая разница пинга для переключения: %s%%" % cur)
-    tol = input("3. Новая разница в %% или [Enter] оставить %s%%: " % (cur, cur))
+    tol = input("3. Новая разница в %% или [Enter] оставить %s%%: " % cur)
     print("="*70)
     if tol.strip():
         try:
@@ -575,11 +533,10 @@ CHOOSE_CMD
 chmod +x /opt/bin/choose
 echo "  Создано"
 
-# ===== [10/13] INIT-СКРИПТЫ (все неблокирующие) =====
+# ===== [10/13] INIT-СКРИПТЫ =====
 echo ""
 echo "[10/13] Создание init-скриптов..."
 
-# S05xkeen - автозапуск Xray
 cat > /opt/etc/init.d/S05xkeen << 'S05_EOF'
 #!/bin/sh
 XRAY=/opt/bin/xray
@@ -599,7 +556,6 @@ esac
 S05_EOF
 chmod +x /opt/etc/init.d/S05xkeen
 
-# S10crond - запуск cron
 cat > /opt/etc/init.d/S10crond << 'S10_EOF'
 #!/bin/sh
 case "$1" in
@@ -613,7 +569,6 @@ esac
 S10_EOF
 chmod +x /opt/etc/init.d/S10crond
 
-# S90restore_cron - восстановление crontab после reboot (tmpfs!)
 cat > /opt/etc/init.d/S90restore_cron << 'S90_EOF'
 #!/bin/sh
 case "$1" in
@@ -626,7 +581,6 @@ esac
 S90_EOF
 chmod +x /opt/etc/init.d/S90restore_cron
 
-# S99xray_net - правила iptables (фон, не блокирует SSH)
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
 (
@@ -657,7 +611,7 @@ with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f:
 PYURL
 echo "  Ссылка сохранена"
 
-# ===== [12/13] ОЧИСТКА (экономия памяти!) =====
+# ===== [12/13] ОЧИСТКА =====
 echo ""
 echo "[12/13] Очистка временных файлов..."
 rm -rf /opt/var/opkg-lists/*
@@ -668,6 +622,7 @@ echo "  Очищено. Свободно: $(df -h /opt | tail -1 | awk '{print $
 # ===== [13/13] ПЕРВЫЙ ЗАПУСК =====
 echo ""
 echo "[13/13] Первый запуск..."
+mkdir -p /opt/var/spool/cron/crontabs
 /opt/etc/init.d/S05xkeen start
 sleep 3
 /opt/bin/choose
@@ -679,7 +634,4 @@ echo "============================================"
 echo "  Xray:   $(ps | grep -v grep | grep -c xray) процесс(ов)"
 echo "  Cron:   $(crontab -l 2>/dev/null | grep -c subkeen_cron) задача"
 echo "  Место:  $(df -h /opt | tail -1 | awk '{print $4}') свободно"
-echo ""
-echo "  ОБЯЗАТЕЛЬНО проверьте после reboot:"
-echo "    iptables -t nat -L xkeen -n -v | grep REDIRECT"
 echo "============================================"
