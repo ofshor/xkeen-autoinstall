@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 5.2: Добавлена остановка Xray перед обновлением (fix Text file busy)
+# Версия 5.3: Удалена опасная очистка, ломавшая xkeen -restart
 # ============================================================
 set -e
 
@@ -9,7 +9,7 @@ set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v5.2"
+echo "  XKeen + SubKeen Auto-Install v5.3"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -69,10 +69,8 @@ done
 # ===== [4/13] XRAY =====
 echo ""
 echo "[4/13] Установка Xray..."
-# Останавливаем запущенный Xray, чтобы избежать ошибки "Text file busy" при распаковке
 killall xray 2>/dev/null || true
 sleep 1
-
 cd /tmp
 XRAY_VER="v26.9.30"
 if ! curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-$XRAY_ARCH.zip"; then
@@ -299,7 +297,6 @@ def main():
                 dst = "%s.%d" % (f, i)
                 if os.path.exists(src): shutil.copy2(src, dst)
     
-    # ИСПРАВЛЕНИЕ: Защита от KeyError, если в файле нет ключа "outbounds"
     ob = load_jsonc(OB)
     if isinstance(ob, list):
         ob = {"outbounds": ob}
@@ -598,7 +595,7 @@ echo "  Ссылка сохранена"
 echo ""
 echo "[12/13] Очистка временных файлов..."
 rm -rf /opt/var/opkg-lists/*
-rm -rf /opt/_xkeen/02_install
+# ИСПРАВЛЕНО: Удалена строка "rm -rf /opt/_xkeen/02_install", которая ломала xkeen -restart
 rm -f /tmp/*.zip /tmp/*.tar.gz /tmp/cron_subkeen.txt
 echo "  Очищено. Свободно: $(df -h /opt | tail -1 | awk '{print $4}')"
 
