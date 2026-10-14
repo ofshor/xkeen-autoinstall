@@ -1,20 +1,28 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 3.1: Исправлены все ошибки (CRLF, iptables, xkeen restart, cron)
+# Версия 4.0: Финальная, стабильная, все ошибки исправлены
 # ============================================================
 set -e
 
-# АВТОЛЕЧЕНИЕ: Убираем Windows-окончания строк (\r), если они попали при скачивании
+# 1. АВТОЛЕЧЕНИЕ: Убираем Windows-окончания строк (\r)
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v3.1"
+echo "  XKeen + SubKeen Auto-Install v4.0"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
 if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
 if [ ! -f /opt/bin/opkg ]; then echo "ОШИБКА: Entware не установлен"; exit 1; fi
+
+# ПРОВЕРКА CURL
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ОШИБКА: curl не установлен!"
+    echo "Выполните: opkg update && opkg install curl"
+    echo "После этого запустите скрипт снова."
+    exit 1
+fi
 
 FREE_MB=$(df /opt | tail -1 | awk '{print int($4/1024)}')
 if [ "$FREE_MB" -lt 20 ]; then
@@ -85,7 +93,8 @@ tar -xzf xkeen.tar.gz -C /opt/ >/dev/null
 rm -f xkeen.tar.gz
 chmod +x /opt/xkeen
 ln -sf /opt/xkeen /opt/bin/xkeen
-# КРИТИЧЕСКИ ВАЖНО: Создаем симлинк для внутренней папки XKeen, чтобы работал xkeen -restart
+
+# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Симлинк для внутренней папки XKeen (чинит xkeen -restart)
 ln -sfn /opt/_xkeen /opt/bin/.xkeen
 echo "  XKeen установлен"
 
@@ -152,9 +161,9 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py (ИЗ ИНСТРУКЦИИ) =====
+# ===== [8/13] subkeen_multi.py =====
 echo ""
-echo "[8/13] Создание subkeen_multi.py (Smart Caching)..."
+echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
 cat > /opt/sbin/SubKeen-current/subkeen_multi.py << 'PYEOF'
 #!/usr/bin/env python3
@@ -372,8 +381,9 @@ def main():
                 bak = f + ".1"
                 if os.path.exists(bak): shutil.copy2(bak, f)
         sys.exit("Конфиг не прошёл тест")
-    # ШТАТНЫЙ ПЕРЕЗАПУСК ЧЕРЕЗ XKEEN (теперь работает благодаря симлинку .xkeen)
+    
     subprocess.run(["xkeen", "-restart"], check=False)
+    
     interval = cfg["subscription"].get("update_interval_hours", 1)
     p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     lines = [l for l in (p.stdout.splitlines() if p.returncode == 0 else []) if "# subkeen_cron" not in l]
@@ -387,7 +397,7 @@ PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 echo "  Создан"
 
-# ===== [9/13] choose (ИЗ ИНСТРУКЦИИ, с исправленным форматированием) =====
+# ===== [9/13] choose =====
 echo ""
 echo "[9/13] Создание команды choose..."
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
@@ -583,6 +593,7 @@ chmod +x /opt/etc/init.d/S90restore_cron
 
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
+# БЕЗОПАСНЫЙ ФОНОВЫЙ ЗАПУСК: не блокирует загрузку SSH
 (
   sleep 20
   /opt/sbin/iptables -t nat -N xkeen 2>/dev/null
