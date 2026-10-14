@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 5.3: Удалена опасная очистка, ломавшая xkeen -restart
+# Версия 6.0: Безопасный iptables, исправленный Python, защита от сбоев
 # ============================================================
 set -e
 
@@ -9,7 +9,7 @@ set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v5.3"
+echo "  XKeen + SubKeen Auto-Install v6.0"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -69,8 +69,10 @@ done
 # ===== [4/13] XRAY =====
 echo ""
 echo "[4/13] Установка Xray..."
+# Останавливаем Xray, чтобы избежать ошибки "Text file busy"
 killall xray 2>/dev/null || true
 sleep 1
+
 cd /tmp
 XRAY_VER="v26.9.30"
 if ! curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-$XRAY_ARCH.zip"; then
@@ -125,7 +127,7 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py =====
+# ===== [8/13] subkeen_multi.py (ПОЛНЫЙ ИСПРАВЛЕННЫЙ КОД) =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
@@ -561,14 +563,35 @@ esac
 S90_EOF
 chmod +x /opt/etc/init.d/S90restore_cron
 
+# БЕЗОПАСНЫЙ СКРИПТ IPTABLES С ИСКЛЮЧЕНИЯМИ
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
+# Находим iptables универсально
+IPT=$(which iptables 2>/dev/null || which /opt/sbin/iptables 2>/dev/null || which /usr/sbin/iptables 2>/dev/null)
+if [ -z "$IPT" ]; then echo "iptables not found"; exit 1; fi
+
 (
   sleep 20
-  /opt/sbin/iptables -t nat -N xkeen 2>/dev/null
-  /opt/sbin/iptables -t nat -C PREROUTING -j xkeen 2>/dev/null || /opt/sbin/iptables -t nat -I PREROUTING 1 -j xkeen
-  /opt/sbin/iptables -t nat -C xkeen -p tcp -j REDIRECT --to-ports 1181 2>/dev/null || /opt/sbin/iptables -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
-  echo "$(date): Xray rules applied" >> /opt/var/log/xray_net.log
+  
+  # Создаем цепочку
+  $IPT -t nat -N xkeen 2>/dev/null
+  
+  # Добавляем в PREROUTING (только если еще нет)
+  $IPT -t nat -C PREROUTING -j xkeen 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j xkeen
+  
+  # Очищаем старые правила в цепочке xkeen, чтобы не дублировать
+  $IPT -t nat -F xkeen 2>/dev/null
+  
+  # ИСКЛЮЧЕНИЯ: Не заворачиваем локальный трафик и резервные адреса
+  $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
+  $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
+  $IPT -t nat -A xkeen -d 10.0.0.0/8 -j RETURN
+  $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
+  
+  # Основное правило: весь остальной TCP трафик на порт 1181
+  $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
+  
+  echo "$(date): Xray rules applied safely" >> /opt/var/log/xray_net.log
 ) &
 S99_EOF
 chmod +x /opt/etc/init.d/S99xray_net
@@ -595,7 +618,6 @@ echo "  Ссылка сохранена"
 echo ""
 echo "[12/13] Очистка временных файлов..."
 rm -rf /opt/var/opkg-lists/*
-# ИСПРАВЛЕНО: Удалена строка "rm -rf /opt/_xkeen/02_install", которая ломала xkeen -restart
 rm -f /tmp/*.zip /tmp/*.tar.gz /tmp/cron_subkeen.txt
 echo "  Очищено. Свободно: $(df -h /opt | tail -1 | awk '{print $4}')"
 
@@ -605,6 +627,11 @@ echo "[13/13] Первый запуск..."
 mkdir -p /opt/var/spool/cron/crontabs
 /opt/etc/init.d/S05xkeen start
 sleep 3
+
+# Применяем правила iptables сразу, не дожидаясь перезагрузки
+/opt/etc/init.d/S99xray_net start
+sleep 25 # Ждем выполнения фонового процесса (sleep 20 внутри)
+
 /opt/bin/choose
 
 echo ""
