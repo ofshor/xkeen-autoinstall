@@ -1,26 +1,24 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 4.0: Финальная, стабильная, все ошибки исправлены
+# Версия 5.0: Использует оригинальные конфиги XKeen
 # ============================================================
 set -e
 
-# 1. АВТОЛЕЧЕНИЕ: Убираем Windows-окончания строк (\r)
+# АВТОЛЕЧЕНИЕ: Убираем Windows-окончания строк
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v4.0"
+echo "  XKeen + SubKeen Auto-Install v5.0"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
 if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
 if [ ! -f /opt/bin/opkg ]; then echo "ОШИБКА: Entware не установлен"; exit 1; fi
 
-# ПРОВЕРКА CURL
 if ! command -v curl >/dev/null 2>&1; then
     echo "ОШИБКА: curl не установлен!"
     echo "Выполните: opkg update && opkg install curl"
-    echo "После этого запустите скрипт снова."
     exit 1
 fi
 
@@ -93,51 +91,15 @@ tar -xzf xkeen.tar.gz -C /opt/ >/dev/null
 rm -f xkeen.tar.gz
 chmod +x /opt/xkeen
 ln -sf /opt/xkeen /opt/bin/xkeen
-
-# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Симлинк для внутренней папки XKeen (чинит xkeen -restart)
 ln -sfn /opt/_xkeen /opt/bin/.xkeen
 echo "  XKeen установлен"
 
-# ===== [6/13] КОНФИГИ XRAY =====
+# ===== [6/13] КОНФИГИ XRAY (оригинальные от XKeen) =====
 echo ""
-echo "[6/13] Создание конфигов Xray..."
+echo "[6/13] Копирование оригинальных конфигов Xray..."
 mkdir -p /opt/etc/xray/configs
-cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/ 2>/dev/null || true
+cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/
 touch /opt/etc/xray/geoip.dat /opt/etc/xray/geosite.dat
-
-# Принудительно создаем рабочие DNS и Outbounds, чтобы xray -test не падал
-cat > /opt/etc/xray/configs/02_dns.json << 'DNS_EOF'
-{
-  "dns": {
-    "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
-  }
-}
-DNS_EOF
-
-cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
-{
-  "outbounds": [
-    {"protocol": "freedom", "tag": "direct"},
-    {"protocol": "blackhole", "tag": "block"},
-    {"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": 443, "users": [{"id": "00000000-0000-0000-0000-000000000000", "encryption": "none"}]}]}, "streamSettings": {"network": "tcp", "security": "none"}, "tag": "proxy-00"}
-  ]
-}
-OB_EOF
-
-cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
-{
-  "routing": {
-    "rules": [
-      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "type": "field", "network": "udp", "port": "135, 137, 138, 139"},
-      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "type": "field", "domain": ["appcenter.ms"]},
-      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "type": "field", "domain": ["regexp:^([\\w\\-\\.]+\\.)ru$", "regexp:^([\\w\\-\\.]+\\.)su$", "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$", "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$", "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$", "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$", "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$", "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$", "regexp:^([\\w\\-\\.]+\\.)moscow$", "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"]},
-      {"inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "type": "field", "protocol": ["bittorrent"]},
-      {"inboundTag": ["redirect", "tproxy"], "balancerTag": "auto-balancer", "type": "field"}
-    ],
-    "balancers": [{"tag": "auto-balancer", "selector": ["proxy-"], "strategy": {"type": "leastPing"}}]
-  }
-}
-ROUTING_EOF
 
 printf "  Проверка конфига: "
 if /opt/bin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | grep -q "Configuration OK"; then
@@ -161,7 +123,7 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py =====
+# ===== [8/13] subkeen_multi.py (из инструкции) =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
@@ -397,7 +359,7 @@ PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 echo "  Создан"
 
-# ===== [9/13] choose =====
+# ===== [9/13] choose (из инструкции) =====
 echo ""
 echo "[9/13] Создание команды choose..."
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
@@ -593,7 +555,6 @@ chmod +x /opt/etc/init.d/S90restore_cron
 
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
-# БЕЗОПАСНЫЙ ФОНОВЫЙ ЗАПУСК: не блокирует загрузку SSH
 (
   sleep 20
   /opt/sbin/iptables -t nat -N xkeen 2>/dev/null
