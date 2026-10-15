@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # Автоустановка XKeen + Xray + SubKeen на Keenetic (Online)
-# Версия 6.0: Безопасный iptables, исправленный Python, защита от сбоев
+# Версия 7.1: Исправлен баг split в choose, безопасный iptables
 # ============================================================
 set -e
 
@@ -9,7 +9,7 @@ set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v6.0"
+echo "  XKeen + SubKeen Auto-Install v7.1"
 echo "============================================"
 
 # ===== БАЗОВЫЕ ПРОВЕРКИ =====
@@ -69,10 +69,8 @@ done
 # ===== [4/13] XRAY =====
 echo ""
 echo "[4/13] Установка Xray..."
-# Останавливаем Xray, чтобы избежать ошибки "Text file busy"
 killall xray 2>/dev/null || true
 sleep 1
-
 cd /tmp
 XRAY_VER="v26.9.30"
 if ! curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-$XRAY_ARCH.zip"; then
@@ -98,7 +96,7 @@ ln -sf /opt/xkeen /opt/bin/xkeen
 ln -sfn /opt/_xkeen /opt/bin/.xkeen
 echo "  XKeen установлен"
 
-# ===== [6/13] КОНФИГИ XRAY (оригинальные от XKeen) =====
+# ===== [6/13] КОНФИГИ XRAY =====
 echo ""
 echo "[6/13] Копирование оригинальных конфигов Xray..."
 mkdir -p /opt/etc/xray/configs
@@ -127,7 +125,7 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 CONF_EOF
 echo "  Создан"
 
-# ===== [8/13] subkeen_multi.py (ПОЛНЫЙ ИСПРАВЛЕННЫЙ КОД) =====
+# ===== [8/13] subkeen_multi.py =====
 echo ""
 echo "[8/13] Создание subkeen_multi.py..."
 mkdir -p /opt/sbin/SubKeen-current
@@ -369,7 +367,7 @@ PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 echo "  Создан"
 
-# ===== [9/13] choose =====
+# ===== [9/13] choose (ИСПРАВЛЕН БАГ С SPLIT) =====
 echo ""
 echo "[9/13] Создание команды choose..."
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
@@ -446,6 +444,7 @@ try:
     geo_data, resolved_data = get_smart_geo_data(urls, config)
     servers = []
     for i, u in enumerate(urls):
+        # ИСПРАВЛЕНО: добавлен индекс [1] для получения строки имени
         name = unquote(u.split('#', 1)[1])
         hostname = urlparse(u.replace("vless://", "http://", 1)).hostname
         ip = resolved_data.get(hostname, "N/A")
@@ -465,7 +464,7 @@ try:
         print("Авто-выбор по пингу.")
     else:
         nums = [int(x.strip()) for x in choice.split(',') if x.strip().isdigit()]
-        chosen = [servers[i][1] for i in nums if i < len(servers)]
+        chosen = [str(servers[i][1]) for i in nums if i < len(servers)]
         config['priority']['patterns'] = chosen
         print("Приоритет: %s" % ', '.join(chosen))
     print("\n" + "="*70)
@@ -473,7 +472,7 @@ try:
     print("="*70)
     if bl.strip():
         bl_nums = [int(x.strip()) for x in bl.split(',') if x.strip().isdigit()]
-        new_bl = [servers[n][2] for n in bl_nums if n < len(servers) and servers[n][2] != "N/A"]
+        new_bl = [str(servers[n][2]) for n in bl_nums if n < len(servers) and servers[n][2] != "N/A"]
         if 'exclusions' not in config: config['exclusions'] = {}
         config['exclusions']['manual_ip_blacklist'] = new_bl
         print("Черный список: %s" % ', '.join(new_bl))
@@ -563,36 +562,36 @@ esac
 S90_EOF
 chmod +x /opt/etc/init.d/S90restore_cron
 
-# БЕЗОПАСНЫЙ СКРИПТ IPTABLES С ИСКЛЮЧЕНИЯМИ
+# БЕЗОПАСНЫЙ СКРИПТ IPTABLES С МГНОВЕННЫМ РЕЖИМОМ
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
-# Находим iptables универсально
 IPT=$(which iptables 2>/dev/null || which /opt/sbin/iptables 2>/dev/null || which /usr/sbin/iptables 2>/dev/null)
 if [ -z "$IPT" ]; then echo "iptables not found"; exit 1; fi
 
-(
-  sleep 20
-  
-  # Создаем цепочку
+apply_rules() {
   $IPT -t nat -N xkeen 2>/dev/null
-  
-  # Добавляем в PREROUTING (только если еще нет)
   $IPT -t nat -C PREROUTING -j xkeen 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j xkeen
-  
-  # Очищаем старые правила в цепочке xkeen, чтобы не дублировать
   $IPT -t nat -F xkeen 2>/dev/null
   
-  # ИСКЛЮЧЕНИЯ: Не заворачиваем локальный трафик и резервные адреса
+  # Исключения для безопасности
   $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
   $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
   $IPT -t nat -A xkeen -d 10.0.0.0/8 -j RETURN
   $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
   
-  # Основное правило: весь остальной TCP трафик на порт 1181
   $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
-  
-  echo "$(date): Xray rules applied safely" >> /opt/var/log/xray_net.log
-) &
+  echo "$(date): Xray rules applied" >> /opt/var/log/xray_net.log
+}
+
+case "$1" in
+    start)
+        if [ "$2" = "force" ]; then
+            apply_rules
+        else
+            ( sleep 20; apply_rules ) &
+        fi
+        ;;
+esac
 S99_EOF
 chmod +x /opt/etc/init.d/S99xray_net
 echo "  Создано: S05xkeen, S10crond, S90restore_cron, S99xray_net"
@@ -604,14 +603,14 @@ echo "Введите ссылку на подписку (vless://):"
 read SUB_URL
 if [ -z "$SUB_URL" ]; then echo "ОШИБКА: ссылка не указана"; exit 1; fi
 
-python3 - "$SUB_URL" << 'PYURL'
+python3 -c "
 import json, sys
 with open('/opt/etc/xray/subkeen.conf.json', 'r', encoding='utf-8') as f:
     cfg = json.load(f)
 cfg['subscription']['url'] = sys.argv[1]
 with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-PYURL
+" "$SUB_URL"
 echo "  Ссылка сохранена"
 
 # ===== [12/13] ОЧИСТКА =====
@@ -628,9 +627,9 @@ mkdir -p /opt/var/spool/cron/crontabs
 /opt/etc/init.d/S05xkeen start
 sleep 3
 
-# Применяем правила iptables сразу, не дожидаясь перезагрузки
-/opt/etc/init.d/S99xray_net start
-sleep 25 # Ждем выполнения фонового процесса (sleep 20 внутри)
+# Применяем правила мгновенно (force)
+/opt/etc/init.d/S99xray_net start force
+sleep 2
 
 /opt/bin/choose
 
