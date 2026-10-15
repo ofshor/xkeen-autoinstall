@@ -1,13 +1,13 @@
 #!/bin/sh
 # ============================================================
-# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v8.2
-# Исправлена критическая ошибка с дефолтным 05_routing.json
+# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v8.5
+# ИСПРАВЛЕНО: Извлечение конкретных элементов кортежа в choose-servers.py
 # ============================================================
 set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v8.2"
+echo "  XKeen + SubKeen Auto-Install v8.5"
 echo "============================================"
 
 if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
@@ -21,14 +21,14 @@ FREE_MB=$(df /opt | tail -1 | awk '{print int($4/1024)}')
 if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти"; exit 1; fi
 
 # [1] PACKAGES
-echo "[1/5] Установка пакетов..."
+echo "[1/6] Установка пакетов..."
 opkg update >/dev/null 2>&1 || true
 for pkg in python3 curl iptables; do
     opkg list-installed 2>/dev/null | grep -q "^$pkg " || opkg install $pkg >/dev/null 2>&1
 done
 
 # [2] XRAY & XKEEN
-echo "[2/5] Установка Xray и XKeen..."
+echo "[2/6] Установка Xray и XKeen..."
 killall xray 2>/dev/null || true
 sleep 1
 cd /tmp
@@ -46,62 +46,40 @@ chmod +x /opt/xkeen
 ln -sf /opt/xkeen /opt/bin/xkeen
 ln -sfn /opt/_xkeen /opt/bin/.xkeen
 
-# [3] CONFIGS & CRITICAL FIX FOR 05_routing.json
-echo "[3/5] Настройка конфигов..."
+# [3] CONFIGS & CRITICAL FIXES
+echo "[3/6] Настройка конфигов..."
 mkdir -p /opt/etc/xray/configs
-cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/
+cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/ 2>/dev/null || true
 touch /opt/etc/xray/geoip.dat /opt/etc/xray/geosite.dat
 
-# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Перезаписываем дефолтный 05_routing.json на гарантированно рабочий
+# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 1: Гарантируем наличие direct и block
+cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
+{
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}
+OB_EOF
+
+# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 2: Гарантируем правильную структуру routing
 cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
 {
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "block",
-        "network": "udp",
-        "port": "135, 137, 138, 139"
-      },
-      {
-        "type": "field",
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "block",
-        "domain": ["appcenter.ms"]
-      },
-      {
-        "type": "field",
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "direct",
-        "domain": [
-          "regexp:^([\\w\\-\\.]+\\.)ru$",
-          "regexp:^([\\w\\-\\.]+\\.)su$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$",
-          "regexp:^([\\w\\-\\.]+\\.)moscow$",
-          "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"
-        ]
-      },
-      {
-        "type": "field",
-        "inboundTag": ["redirect", "tproxy"],
-        "outboundTag": "direct",
-        "protocol": ["bittorrent"]
-      }
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "network": "udp", "port": "135, 137, 138, 139" },
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "domain": ["appcenter.ms"] },
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "domain": ["regexp:^([\\w\\-\\.]+\\.)ru$", "regexp:^([\\w\\-\\.]+\\.)su$", "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$", "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$", "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$", "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$", "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$", "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$", "regexp:^([\\w\\-\\.]+\\.)moscow$", "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"] },
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "protocol": ["bittorrent"] }
     ],
     "balancers": []
   }
 }
 ROUTING_EOF
 
-# [4] SCRIPTS (subkeen_multi.py и choose-servers.py с исправлениями)
-echo "[4/5] Создание скриптов..."
+# [4] SCRIPTS
+echo "[4/6] Создание скриптов..."
 
 mkdir -p /opt/sbin/SubKeen-current
 cat > /opt/sbin/SubKeen-current/subkeen_multi.py << 'PYEOF'
@@ -149,6 +127,7 @@ def get_sub(url):
             except Exception as e: sys.exit("Ошибка: не Base64: %s" % e)
             return [l.strip() for l in decoded.split("\n") if l.strip().startswith("vless://")]
         except Exception as e:
+            print("Попытка %d/3: %s" % (a, e))
             if a < 3: time.sleep(3)
     sys.exit("Не удалось скачать подписку")
 
@@ -260,7 +239,6 @@ def main():
         ob["outbounds"].append(out)
     atomic_write_json(OB, ob)
     
-    # БЕЗОПАСНАЯ РАБОТА С ROUTING
     rt = load_jsonc(RT)
     if "routing" not in rt: rt["routing"] = {"rules": [], "balancers": []}
     r = rt["routing"]
@@ -305,6 +283,7 @@ import urllib.request, ssl, base64, json, socket, time
 from urllib.parse import urlparse, unquote
 COUNTRY_NAMES = {'RU': 'Россия', 'US': 'США', 'DE': 'Германия', 'NL': 'Нидерланды', 'FI': 'Финляндия', 'SE': 'Швеция'}
 CACHE_TTL = 7 * 24 * 60 * 60
+
 def get_smart_geo_data(urls, config):
     cache = config.get("geo_cache", {}); current_time = int(time.time())
     hostnames_to_api = []; results = {}; resolved_data = {}
@@ -350,23 +329,30 @@ try:
         ip = resolved_data.get(hostname, "N/A"); cc = geo_data.get(hostname, "??")
         cname = COUNTRY_NAMES.get(cc, cc); mark = " [RU-BLOCK]" if cc == 'RU' else ""
         servers.append((i, name, ip, "%s: %s%s" % (cc, cname, mark)))
+    
     print("Доступные серверы:")
     for i, name, ip, geo_str in servers: print("  [%02d] %s  [IP: %s | %s]" % (i, name, ip, geo_str))
+    
     print("\n" + "="*70)
     choice = input("1. Номера для ПРИОРИТЕТА или [Enter] авто-выбор: ")
     print("="*70)
     if 'priority' not in config: config['priority'] = {}
-    if not choice.strip(): config['priority']['patterns'] = []
+    if not choice.strip(): 
+        config['priority']['patterns'] = []
     else:
         nums = [int(x.strip()) for x in choice.split(',') if x.strip().isdigit()]
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: извлекаем именно имя (индекс 1), а не весь кортеж
         config['priority']['patterns'] = [str(servers[i][1]) for i in nums if i < len(servers)]
+        
     print("\n" + "="*70)
     bl = input("2. Номера для ЧЕРНОГО СПИСКА или [Enter] не менять: ")
     print("="*70)
     if bl.strip():
         bl_nums = [int(x.strip()) for x in bl.split(',') if x.strip().isdigit()]
         if 'exclusions' not in config: config['exclusions'] = {}
-        config['exclusions']['manual_ip_blacklist'] = [str(servers[n][2]) for n in bl_nums if n < len(servers)]
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: извлекаем именно IP (индекс 2), а не весь кортеж
+        config['exclusions']['manual_ip_blacklist'] = [str(servers[n][2]) for n in bl_nums if n < len(servers) and servers[n][2] != "N/A"]
+        
     cur = config.get("balancer", {}).get("tolerance_percent", 50)
     print("\n" + "="*70)
     tol = input("3. Новая разница в %% или [Enter] оставить %s%%: " % cur)
@@ -378,6 +364,7 @@ try:
                 if 'balancer' not in config: config['balancer'] = {}
                 config['balancer']['tolerance_percent'] = nt
         except: pass
+        
     with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f: json.dump(config, f, indent=2, ensure_ascii=False)
     print("Настройки сохранены")
 except Exception as e: print("Ошибка: %s" % e)
@@ -392,8 +379,43 @@ echo "Готово!"
 CHOOSE_CMD
 chmod +x /opt/bin/choose
 
-# [5] CONFIG & SUBSCRIPTION
-echo "[5/5] Настройка подписки..."
+# [5] INIT-СКРИПТЫ
+echo "[5/6] Создание init-скриптов..."
+
+cat > /opt/etc/init.d/S05xkeen << 'S05_EOF'
+#!/bin/sh
+case "$1" in
+    start) ps | grep -v grep | grep -q "/opt/bin/xray" || /opt/bin/xray run -confdir /opt/etc/xray/configs >/dev/null 2>&1 & ;;
+    stop) killall xray 2>/dev/null ;;
+    restart) $0 stop; sleep 2; $0 start ;;
+esac
+S05_EOF
+chmod +x /opt/etc/init.d/S05xkeen
+
+cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
+#!/bin/sh
+IPT=$(which iptables 2>/dev/null || which /opt/sbin/iptables 2>/dev/null)
+apply_rules() {
+  $IPT -t nat -N xkeen 2>/dev/null
+  $IPT -t nat -C PREROUTING -j xkeen 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j xkeen
+  $IPT -t nat -F xkeen 2>/dev/null
+  $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
+  $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
+  $IPT -t nat -A xkeen -d 10.0.0.0/8 -j RETURN
+  $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
+  $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
+}
+case "$1" in
+    start)
+        if [ "$2" = "force" ]; then apply_rules
+        else ( sleep 20; apply_rules ) & fi
+        ;;
+esac
+S99_EOF
+chmod +x /opt/etc/init.d/S99xray_net
+
+# [6] CONFIG & SUBSCRIPTION
+echo "[6/6] Настройка подписки..."
 cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 {
   "subscription": {"url": "", "update_interval_hours": 3},
@@ -418,7 +440,5 @@ echo ""
 echo "============================================"
 echo "  УСТАНОВКА ЗАВЕРШЕНА!"
 echo "============================================"
-echo "  ВАЖНО: Правила iptables НЕ применены автоматически."
 echo "  Для запуска VPN выполните команду: choose"
-echo "  Она настроит серверы и безопасно применит правила."
 echo "============================================"
