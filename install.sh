@@ -24,7 +24,7 @@ if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти"; exit 
 echo "[1/6] Установка пакетов..."
 opkg update >/dev/null 2>&1 || true
 for pkg in python3 curl iptables unzip; do
-    opkg list-installed 2>/dev/null | grep -q "^$pkg " || opkg install $pkg >/dev/null 2>&1
+    opkg list-installed 2>/dev/null | grep -q "^$pkg " || opkg install $pkg >/dev/null 2>&1 || true
 done
 
 # [2] XRAY & XKEEN
