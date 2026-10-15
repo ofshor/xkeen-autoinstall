@@ -18,7 +18,7 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 FREE_MB=$(df /opt | tail -1 | awk '{print int($4/1024)}')
-if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти (требуется минимум 20 МБ)"; exit 1; fi
+if [ "$FREE_MB" -lt 80 ]; then echo "ОШИБКА: мало памяти (требуется минимум 80 МБ)"; exit 1; fi
 
 # [1] PACKAGES
 echo "[1/6] Установка пакетов..."
@@ -216,7 +216,12 @@ def get_smart_geo_data(urls, config):
         if ips_to_query:
             try:
                 data = json.dumps(ips_to_query).encode('utf-8')
-                req = urllib.request.Request('https://ip-api.com/batch', data=data, headers={'Content-Type': 'application/json'}, method='POST')
+                # ДОБАВЛЕН User-Agent для обхода блокировки 403 от ip-api.com
+                headers = {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+                req = urllib.request.Request('https://ip-api.com/batch', data=data, headers=headers, method='POST')
                 with urllib.request.urlopen(req, timeout=15) as r:
                     api_results = json.loads(r.read().decode())
                 if isinstance(api_results, list):
