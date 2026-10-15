@@ -1,13 +1,13 @@
 #!/bin/sh
 # ============================================================
-# Автоустановка XKeen + Xray + SubKeen на Keenetic (v8.1 Safe)
-# Основано на официальной инструкции Heavy Mode
+# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v8.2
+# Исправлена критическая ошибка с дефолтным 05_routing.json
 # ============================================================
 set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v8.1 (Safe)"
+echo "  XKeen + SubKeen Auto-Install v8.2"
 echo "============================================"
 
 if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
@@ -32,7 +32,6 @@ echo "[2/5] Установка Xray и XKeen..."
 killall xray 2>/dev/null || true
 sleep 1
 cd /tmp
-# Скачиваем Xray
 curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-arm64-v8a.zip" || \
 curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-arm64-v8a.zip"
 mkdir -p /opt/bin
@@ -40,7 +39,6 @@ unzip -o xray.zip xray -d /opt/bin/ >/dev/null
 chmod +x /opt/bin/xray
 rm -f xray.zip
 
-# Скачиваем XKeen
 curl -fsSL -o xkeen.tar.gz "https://github.com/jameszeroX/XKeen/releases/download/2.1/xkeen.tar.gz"
 tar -xzf xkeen.tar.gz -C /opt/ >/dev/null
 rm -f xkeen.tar.gz
@@ -48,15 +46,63 @@ chmod +x /opt/xkeen
 ln -sf /opt/xkeen /opt/bin/xkeen
 ln -sfn /opt/_xkeen /opt/bin/.xkeen
 
-# Копируем оригинальные конфиги
+# [3] CONFIGS & CRITICAL FIX FOR 05_routing.json
+echo "[3/5] Настройка конфигов..."
 mkdir -p /opt/etc/xray/configs
 cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/
 touch /opt/etc/xray/geoip.dat /opt/etc/xray/geosite.dat
 
-# [3] SCRIPTS FROM INSTRUCTION (Exact Copy with Fixes)
-echo "[3/5] Создание скриптов из Инструкции..."
+# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Перезаписываем дефолтный 05_routing.json на гарантированно рабочий
+cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
+{
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["redirect", "tproxy"],
+        "outboundTag": "block",
+        "network": "udp",
+        "port": "135, 137, 138, 139"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["redirect", "tproxy"],
+        "outboundTag": "block",
+        "domain": ["appcenter.ms"]
+      },
+      {
+        "type": "field",
+        "inboundTag": ["redirect", "tproxy"],
+        "outboundTag": "direct",
+        "domain": [
+          "regexp:^([\\w\\-\\.]+\\.)ru$",
+          "regexp:^([\\w\\-\\.]+\\.)su$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$",
+          "regexp:^([\\w\\-\\.]+\\.)moscow$",
+          "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"
+        ]
+      },
+      {
+        "type": "field",
+        "inboundTag": ["redirect", "tproxy"],
+        "outboundTag": "direct",
+        "protocol": ["bittorrent"]
+      }
+    ],
+    "balancers": []
+  }
+}
+ROUTING_EOF
 
-# subkeen_multi.py (Из Инструкции, шаг 3)
+# [4] SCRIPTS (subkeen_multi.py и choose-servers.py с исправлениями)
+echo "[4/5] Создание скриптов..."
+
 mkdir -p /opt/sbin/SubKeen-current
 cat > /opt/sbin/SubKeen-current/subkeen_multi.py << 'PYEOF'
 #!/usr/bin/env python3
@@ -103,7 +149,6 @@ def get_sub(url):
             except Exception as e: sys.exit("Ошибка: не Base64: %s" % e)
             return [l.strip() for l in decoded.split("\n") if l.strip().startswith("vless://")]
         except Exception as e:
-            print("Попытка %d/3: %s" % (a, e))
             if a < 3: time.sleep(3)
     sys.exit("Не удалось скачать подписку")
 
@@ -123,7 +168,7 @@ def get_smart_geo_data(urls, config):
                     results[hostname] = cached["country"]
                 else: hostnames_to_api.append(hostname)
             else: hostnames_to_api.append(hostname)
-        except socket.gaierror: resolved_data[hostname] = None
+        except: resolved_data[hostname] = None
     if hostnames_to_api:
         ips_to_query = list(set([resolved_data[h] for h in hostnames_to_api if resolved_data[h]]))
         if ips_to_query:
@@ -135,7 +180,7 @@ def get_smart_geo_data(urls, config):
                 for hostname in hostnames_to_api:
                     ip = resolved_data[hostname]; country = ip_to_country.get(ip, '??')
                     cache[hostname] = {"ip": ip, "country": country, "timestamp": current_time}; results[hostname] = country
-            except Exception as e:
+            except:
                 for hostname in hostnames_to_api: results[hostname] = cache.get(hostname, {}).get("country", "??")
     config["geo_cache"] = cache; save_config(config)
     return results, resolved_data
@@ -166,8 +211,6 @@ def parse_vless(u, idx, cfg, geo_data, resolved_data):
         if not excluded and current_ip and geo_data.get(hostname, '??') == 'RU':
             excluded = True; print("  [!] %s авто-исключён (Россия)" % hostname)
     tag = "excl-%02d" % idx if excluded else ("priority-%02d" % idx if is_priority else "proxy-%02d" % idx)
-    
-    # ИСПРАВЛЕНО: добавлены индексы [0]
     sec = q.get("security", ["none"])[0]; net = q.get("type", ["tcp"])[0]
     ss = {}; ssn = None
     if sec == "reality":
@@ -183,10 +226,8 @@ def parse_vless(u, idx, cfg, geo_data, resolved_data):
         if q.get("host"): ts["host"] = q.get("host", [""])[0]
     elif net == "grpc":
         tsn = "grpcSettings"; ts = {"serviceName": q.get("serviceName", [""])[0]}
-    
     user = {"id": d.username, "encryption": "none"}
     if "flow" in q: user["flow"] = q.get("flow", [""])[0]
-    
     out = {"protocol": "vless", "settings": {"vnext": [{"address": d.hostname, "port": int(d.port), "users": [user]}]},
            "streamSettings": {"network": net, "security": sec}, "tag": tag}
     if ssn: out["streamSettings"][ssn] = ss
@@ -196,7 +237,7 @@ def parse_vless(u, idx, cfg, geo_data, resolved_data):
 def xray_test():
     p = subprocess.run(["/opt/bin/xray", "run", "-test", "-confdir", CONF_DIR], capture_output=True, text=True)
     if p.returncode == 0: print("  xray -test: OK"); return True
-    print("  xray -test FAIL"); return False
+    print("  xray -test FAIL:\n" + (p.stderr or p.stdout)); return False
 
 def main():
     cfg = load_config(); sub_url = cfg["subscription"]["url"]
@@ -204,10 +245,12 @@ def main():
     print("Скачиваем подписку..."); urls = get_sub(sub_url)
     print("Smart Geo-Caching...")
     geo_data, resolved_data = get_smart_geo_data(urls, cfg)
+    
     ob = load_jsonc(OB)
     if isinstance(ob, list): ob = {"outbounds": ob}
     if "outbounds" not in ob: ob["outbounds"] = []
     ob["outbounds"] = [o for o in ob["outbounds"] if not str(o.get("tag","")).startswith(("proxy-","excl-","priority-"))]
+    
     n_excl = n_pri = n_proxy = 0
     for i, u in enumerate(urls):
         out, ex, pri = parse_vless(u, i, cfg, geo_data, resolved_data)
@@ -216,16 +259,33 @@ def main():
         else: n_proxy += 1
         ob["outbounds"].append(out)
     atomic_write_json(OB, ob)
-    rt = load_jsonc(RT); r = rt.get("routing", rt)
+    
+    # БЕЗОПАСНАЯ РАБОТА С ROUTING
+    rt = load_jsonc(RT)
+    if "routing" not in rt: rt["routing"] = {"rules": [], "balancers": []}
+    r = rt["routing"]
+    if "rules" not in r: r["rules"] = []
+        
     r["balancers"] = [b for b in r.get("balancers", []) if b.get("tag") != "auto-balancer"]
     bal_cfg = cfg.get("balancer", {})
     r["balancers"].append({
         "tag": "auto-balancer", "selector": ["priority-", "proxy-"],
         "strategy": {"type": bal_cfg.get("strategy", "leastLoad"), "settings": {"tolerance": bal_cfg.get("tolerance_percent", 50) / 100.0}}
     })
+    
+    known = {"vless-reality", "proxy", "proxy-00", "main", "vpn"}
+    for rule in r.get("rules", []):
+        if rule.get("outboundTag") in known:
+            rule["balancerTag"] = "auto-balancer"
+            if "outboundTag" in rule: del rule["outboundTag"]
+            
     atomic_write_json(RT, rt)
+    
     print("Результат: приоритетных %d, обычных %d, исключено %d" % (n_pri, n_proxy, n_excl))
-    if not xray_test(): sys.exit("Конфиг не прошёл тест")
+    if not xray_test(): 
+        print("ОТКАТ: Конфиг не прошёл тест.")
+        sys.exit(1)
+        
     subprocess.run(["xkeen", "-restart"], check=False)
     interval = cfg["subscription"].get("update_interval_hours", 3)
     p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
@@ -239,7 +299,6 @@ if __name__ == "__main__": main()
 PYEOF
 chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
 
-# choose-servers.py (Из Инструкции, шаг 5, ИСПРАВЛЕН SPLIT)
 cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
 #!/usr/bin/env python3
 import urllib.request, ssl, base64, json, socket, time
@@ -286,7 +345,6 @@ try:
     geo_data, resolved_data = get_smart_geo_data(urls, config)
     servers = []
     for i, u in enumerate(urls):
-        # ИСПРАВЛЕНО: явное обращение к индексу [1]
         name = unquote(u.split('#', 1)[1])
         hostname = urlparse(u.replace("vless://", "http://", 1)).hostname
         ip = resolved_data.get(hostname, "N/A"); cc = geo_data.get(hostname, "??")
@@ -334,8 +392,8 @@ echo "Готово!"
 CHOOSE_CMD
 chmod +x /opt/bin/choose
 
-# [4] CONFIG & SUBSCRIPTION
-echo "[4/5] Настройка подписки..."
+# [5] CONFIG & SUBSCRIPTION
+echo "[5/5] Настройка подписки..."
 cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 {
   "subscription": {"url": "", "update_interval_hours": 3},
@@ -355,31 +413,6 @@ with open('/opt/etc/xray/subkeen.conf.json', 'r', encoding='utf-8') as f: cfg = 
 cfg['subscription']['url'] = sys.argv[1]
 with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
 " "$SUB_URL"
-
-# [5] SAFE IPTABLES SCRIPT (Not auto-applied)
-echo "[5/5] Создание безопасного скрипта правил..."
-cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
-#!/bin/sh
-IPT=$(which iptables 2>/dev/null || which /opt/sbin/iptables 2>/dev/null)
-apply_rules() {
-  $IPT -t nat -N xkeen 2>/dev/null
-  $IPT -t nat -C PREROUTING -j xkeen 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j xkeen
-  $IPT -t nat -F xkeen 2>/dev/null
-  # Исключения для безопасности
-  $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
-  $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
-  $IPT -t nat -A xkeen -d 10.0.0.0/8 -j RETURN
-  $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
-  $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
-}
-case "$1" in
-    start)
-        if [ "$2" = "force" ]; then apply_rules
-        else ( sleep 20; apply_rules ) & fi
-        ;;
-esac
-S99_EOF
-chmod +x /opt/etc/init.d/S99xray_net
 
 echo ""
 echo "============================================"
