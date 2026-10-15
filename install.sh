@@ -18,7 +18,7 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 FREE_MB=$(df /opt | tail -1 | awk '{print int($4/1024)}')
-if [ "$FREE_MB" -lt 80 ]; then echo "ОШИБКА: мало памяти (требуется минимум 80 МБ)"; exit 1; fi
+if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти (требуется минимум 20 МБ)"; exit 1; fi
 
 # [1] PACKAGES
 echo "[1/6] Установка пакетов..."
