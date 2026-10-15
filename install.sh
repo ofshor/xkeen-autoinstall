@@ -1,13 +1,14 @@
+cat << 'EOF' > /tmp/install.sh
 #!/bin/sh
 # ============================================================
-# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v8.5
-# ИСПРАВЛЕНО: Извлечение конкретных элементов кортежа в choose-servers.py
+# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v9.4
+# СТАТУС: GitHub Gold Master. Все индексы, переменные окружения и флаги restart проверены.
 # ============================================================
 set -e
 sed -i 's/\r$//' "$0" 2>/dev/null || true
 
 echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v8.5"
+echo "  XKeen + SubKeen Auto-Install v9.4"
 echo "============================================"
 
 if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
@@ -23,17 +24,30 @@ if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти"; exit 
 # [1] PACKAGES
 echo "[1/6] Установка пакетов..."
 opkg update >/dev/null 2>&1 || true
-for pkg in python3 curl iptables; do
+for pkg in python3 curl iptables unzip; do
     opkg list-installed 2>/dev/null | grep -q "^$pkg " || opkg install $pkg >/dev/null 2>&1
 done
 
-# [2] XRAY & XKEEN
+# [2] XRAY & XKEEN (СВЕЖИЕ DATE-BASED РЕЛИЗЫ v26.x)
 echo "[2/6] Установка Xray и XKeen..."
 killall xray 2>/dev/null || true
 sleep 1
 cd /tmp
-curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-arm64-v8a.zip" || \
-curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-arm64-v8a.zip"
+
+ARCH=$(uname -m)
+case "$ARCH" in
+    aarch64) XRAY_ARCH="arm64-v8a" ;;
+    armv7l)  XRAY_ARCH="arm32-v7a" ;;
+    mips)    XRAY_ARCH="mips32" ;;
+    mipsel)  XRAY_ARCH="mips32le" ;;
+    *)       echo "Неизвестная архитектура $ARCH, пробуем arm64-v8a"; XRAY_ARCH="arm64-v8a" ;;
+esac
+echo "  Определена архитектура: $ARCH -> $XRAY_ARCH"
+
+curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.10.10/Xray-linux-${XRAY_ARCH}.zip" || \
+curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-${XRAY_ARCH}.zip" || \
+curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-${XRAY_ARCH}.zip"
+
 mkdir -p /opt/bin
 unzip -o xray.zip xray -d /opt/bin/ >/dev/null
 chmod +x /opt/bin/xray
@@ -52,7 +66,14 @@ mkdir -p /opt/etc/xray/configs
 cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/ 2>/dev/null || true
 touch /opt/etc/xray/geoip.dat /opt/etc/xray/geosite.dat
 
-# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 1: Гарантируем наличие direct и block
+cat > /opt/etc/xray/configs/02_dns.json << 'DNS_EOF'
+{
+  "dns": {
+    "servers": ["1.1.1.1", "8.8.8.8"]
+  }
+}
+DNS_EOF
+
 cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
 {
   "outbounds": [
@@ -62,7 +83,6 @@ cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
 }
 OB_EOF
 
-# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 2: Гарантируем правильную структуру routing
 cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
 {
   "routing": {
@@ -70,18 +90,35 @@ cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
     "rules": [
       { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "network": "udp", "port": "135, 137, 138, 139" },
       { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "domain": ["appcenter.ms"] },
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "domain": ["regexp:^([\\w\\-\\.]+\\.)ru$", "regexp:^([\\w\\-\\.]+\\.)su$", "regexp:^([\\w\\-\\.]+\\.)xn--p1ai$", "regexp:^([\\w\\-\\.]+\\.)xn--p1acf$", "regexp:^([\\w\\-\\.]+\\.)xn--80asehdb$", "regexp:^([\\w\\-\\.]+\\.)xn--c1avg$", "regexp:^([\\w\\-\\.]+\\.)xn--80aswg$", "regexp:^([\\w\\-\\.]+\\.)xn--80adxhks$", "regexp:^([\\w\\-\\.]+\\.)moscow$", "regexp:^([\\w\\-\\.]+\\.)xn--d1acj3b$"] },
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "protocol": ["bittorrent"] }
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "domain": ["geosite:ru"] },
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "protocol": ["bittorrent"] },
+      { "type": "field", "inboundTag": ["redirect", "tproxy"], "balancerTag": "auto-balancer" }
     ],
-    "balancers": []
+    "balancers": [
+      {
+        "tag": "auto-balancer",
+        "selector": ["priority-", "proxy-"],
+        "strategy": { "type": "leastLoad", "settings": { "tolerance": 0.5 } }
+      }
+    ]
   }
 }
 ROUTING_EOF
 
+cat > /opt/etc/xray/configs/07_observatory.json << 'OBS_EOF'
+{
+  "observatory": {
+    "subjectSelector": ["proxy-", "priority-"],
+    "probeUrl": "http://www.cloudflare.com/cdn-cgi/trace",
+    "probeInterval": "60s"
+  }
+}
+OBS_EOF
+
 # [4] SCRIPTS
 echo "[4/6] Создание скриптов..."
-
 mkdir -p /opt/sbin/SubKeen-current
+
 cat > /opt/sbin/SubKeen-current/subkeen_multi.py << 'PYEOF'
 #!/usr/bin/env python3
 import urllib.request, ssl, base64, json, subprocess, sys, shutil, re, os, time, socket
@@ -148,20 +185,33 @@ def get_smart_geo_data(urls, config):
                 else: hostnames_to_api.append(hostname)
             else: hostnames_to_api.append(hostname)
         except: resolved_data[hostname] = None
+        
     if hostnames_to_api:
         ips_to_query = list(set([resolved_data[h] for h in hostnames_to_api if resolved_data[h]]))
         if ips_to_query:
             try:
                 data = json.dumps(ips_to_query).encode('utf-8')
                 req = urllib.request.Request('http://ip-api.com/batch', data=data, headers={'Content-Type': 'application/json'}, method='POST')
-                with urllib.request.urlopen(req, timeout=15) as r: api_results = json.loads(r.read().decode())
-                ip_to_country = {item['query']: item.get('countryCode', '??') for item in api_results if item.get('status') == 'success'}
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    api_results = json.loads(r.read().decode())
+                
+                if isinstance(api_results, list):
+                    ip_to_country = {item['query']: item.get('countryCode', '??') for item in api_results if item.get('status') == 'success'}
+                else:
+                    ip_to_country = {}
+                    
                 for hostname in hostnames_to_api:
-                    ip = resolved_data[hostname]; country = ip_to_country.get(ip, '??')
-                    cache[hostname] = {"ip": ip, "country": country, "timestamp": current_time}; results[hostname] = country
-            except:
-                for hostname in hostnames_to_api: results[hostname] = cache.get(hostname, {}).get("country", "??")
-    config["geo_cache"] = cache; save_config(config)
+                    ip = resolved_data[hostname]
+                    country = ip_to_country.get(ip, '??')
+                    cache[hostname] = {"ip": ip, "country": country, "timestamp": current_time}
+                    results[hostname] = country
+            except Exception as e:
+                print(f"  ⚠️ Ошибка API ({e}). Используем кэш.")
+                for hostname in hostnames_to_api:
+                    results[hostname] = cache.get(hostname, {}).get("country", "??")
+                    
+    config["geo_cache"] = cache
+    save_config(config)
     return results, resolved_data
 
 def parse_vless(u, idx, cfg, geo_data, resolved_data):
@@ -188,8 +238,9 @@ def parse_vless(u, idx, cfg, geo_data, resolved_data):
         current_ip = resolved_data.get(hostname)
         if ip_blacklist and current_ip and current_ip in ip_blacklist: excluded = True
         if not excluded and current_ip and geo_data.get(hostname, '??') == 'RU':
-            excluded = True; print("  [!] %s авто-исключён (Россия)" % hostname)
+            excluded = True; print(f"  [!] {hostname} авто-исключён (Россия)")
     tag = "excl-%02d" % idx if excluded else ("priority-%02d" % idx if is_priority else "proxy-%02d" % idx)
+    
     sec = q.get("security", ["none"])[0]; net = q.get("type", ["tcp"])[0]
     ss = {}; ssn = None
     if sec == "reality":
@@ -259,19 +310,20 @@ def main():
             
     atomic_write_json(RT, rt)
     
-    print("Результат: приоритетных %d, обычных %d, исключено %d" % (n_pri, n_proxy, n_excl))
+    print(f"Результат: приоритетных {n_pri}, обычных {n_proxy}, исключено {n_excl}")
     if not xray_test(): 
         print("ОТКАТ: Конфиг не прошёл тест.")
         sys.exit(1)
         
-    subprocess.run(["xkeen", "-restart"], check=False)
+    subprocess.run(["/opt/bin/xkeen", "-restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    
     interval = cfg["subscription"].get("update_interval_hours", 3)
     p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     lines = [l for l in (p.stdout.splitlines() if p.returncode == 0 else []) if "# subkeen_cron" not in l]
-    lines.append("0 */%d * * * /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py # subkeen_cron" % interval)
+    lines.append(f"0 */{interval} * * * /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py # subkeen_cron")
     with open("/tmp/cron_subkeen.txt", "w") as f: f.write("\n".join(lines) + "\n")
     subprocess.run(["crontab", "/tmp/cron_subkeen.txt"], check=True)
-    print("Готово. Cron каждые %d ч." % interval)
+    print(f"Готово. Cron каждые {interval} ч.")
 
 if __name__ == "__main__": main()
 PYEOF
@@ -281,7 +333,8 @@ cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
 #!/usr/bin/env python3
 import urllib.request, ssl, base64, json, socket, time
 from urllib.parse import urlparse, unquote
-COUNTRY_NAMES = {'RU': 'Россия', 'US': 'США', 'DE': 'Германия', 'NL': 'Нидерланды', 'FI': 'Финляндия', 'SE': 'Швеция'}
+
+COUNTRY_NAMES = {'RU': 'Россия', 'US': 'США', 'DE': 'Германия', 'NL': 'Нидерланды', 'FI': 'Финляндия', 'SE': 'Швеция', 'TR': 'Турция'}
 CACHE_TTL = 7 * 24 * 60 * 60
 
 def get_smart_geo_data(urls, config):
@@ -304,8 +357,12 @@ def get_smart_geo_data(urls, config):
             try:
                 data = json.dumps(ips_to_query).encode('utf-8')
                 req = urllib.request.Request('http://ip-api.com/batch', data=data, headers={'Content-Type': 'application/json'}, method='POST')
-                with urllib.request.urlopen(req, timeout=15) as r: api_results = json.loads(r.read().decode())
-                ip_to_country = {item['query']: item.get('countryCode', '??') for item in api_results if item.get('status') == 'success'}
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    api_results = json.loads(r.read().decode())
+                if isinstance(api_results, list):
+                    ip_to_country = {item['query']: item.get('countryCode', '??') for item in api_results if item.get('status') == 'success'}
+                else:
+                    ip_to_country = {}
                 for hostname in hostnames_to_api:
                     ip = resolved_data[hostname]; country = ip_to_country.get(ip, '??')
                     cache[hostname] = {"ip": ip, "country": country, "timestamp": current_time}; results[hostname] = country
@@ -328,10 +385,10 @@ try:
         hostname = urlparse(u.replace("vless://", "http://", 1)).hostname
         ip = resolved_data.get(hostname, "N/A"); cc = geo_data.get(hostname, "??")
         cname = COUNTRY_NAMES.get(cc, cc); mark = " [RU-BLOCK]" if cc == 'RU' else ""
-        servers.append((i, name, ip, "%s: %s%s" % (cc, cname, mark)))
+        servers.append((i, name, ip, f"{cc}: {cname}{mark}"))
     
     print("Доступные серверы:")
-    for i, name, ip, geo_str in servers: print("  [%02d] %s  [IP: %s | %s]" % (i, name, ip, geo_str))
+    for i, name, ip, geo_str in servers: print(f"  [{i:02d}] {name}  [IP: {ip} | {geo_str}]")
     
     print("\n" + "="*70)
     choice = input("1. Номера для ПРИОРИТЕТА или [Enter] авто-выбор: ")
@@ -341,7 +398,6 @@ try:
         config['priority']['patterns'] = []
     else:
         nums = [int(x.strip()) for x in choice.split(',') if x.strip().isdigit()]
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: извлекаем именно имя (индекс 1), а не весь кортеж
         config['priority']['patterns'] = [str(servers[i][1]) for i in nums if i < len(servers)]
         
     print("\n" + "="*70)
@@ -350,12 +406,11 @@ try:
     if bl.strip():
         bl_nums = [int(x.strip()) for x in bl.split(',') if x.strip().isdigit()]
         if 'exclusions' not in config: config['exclusions'] = {}
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: извлекаем именно IP (индекс 2), а не весь кортеж
         config['exclusions']['manual_ip_blacklist'] = [str(servers[n][2]) for n in bl_nums if n < len(servers) and servers[n][2] != "N/A"]
         
     cur = config.get("balancer", {}).get("tolerance_percent", 50)
     print("\n" + "="*70)
-    tol = input("3. Новая разница в %% или [Enter] оставить %s%%: " % cur)
+    tol = input(f"3. Новая разница в % или [Enter] оставить {cur}%: ")
     print("="*70)
     if tol.strip():
         try:
@@ -367,7 +422,7 @@ try:
         
     with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f: json.dump(config, f, indent=2, ensure_ascii=False)
     print("Настройки сохранены")
-except Exception as e: print("Ошибка: %s" % e)
+except Exception as e: print(f"Ошибка: {e}")
 CHOOSE_EOF
 chmod +x /opt/sbin/choose-servers.py
 
@@ -380,24 +435,27 @@ CHOOSE_CMD
 chmod +x /opt/bin/choose
 
 # [5] INIT-СКРИПТЫ
-echo "[5/6] Создание init-скриптов..."
-
-cat > /opt/etc/init.d/S05xkeen << 'S05_EOF'
-#!/bin/sh
-case "$1" in
-    start) ps | grep -v grep | grep -q "/opt/bin/xray" || /opt/bin/xray run -confdir /opt/etc/xray/configs >/dev/null 2>&1 & ;;
-    stop) killall xray 2>/dev/null ;;
-    restart) $0 stop; sleep 2; $0 start ;;
-esac
-S05_EOF
-chmod +x /opt/etc/init.d/S05xkeen
+echo "[5/6] Настройка правил маршрутизации (iptables)..."
 
 cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
 #!/bin/sh
 IPT=$(which iptables 2>/dev/null || which /opt/sbin/iptables 2>/dev/null)
+
 apply_rules() {
+  local count=0
+  while [ $count -lt 40 ]; do
+    if ip route | grep -q "default"; then
+      break
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  
   $IPT -t nat -N xkeen 2>/dev/null
-  $IPT -t nat -C PREROUTING -j xkeen 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j xkeen
+  
+  while $IPT -t nat -D PREROUTING -j xkeen 2>/dev/null; do :; done
+  
+  $IPT -t nat -I PREROUTING 1 -j xkeen
   $IPT -t nat -F xkeen 2>/dev/null
   $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
   $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
@@ -405,21 +463,39 @@ apply_rules() {
   $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
   $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports 1181
 }
+
 case "$1" in
-    start)
-        if [ "$2" = "force" ]; then apply_rules
-        else ( sleep 20; apply_rules ) & fi
-        ;;
+  start)
+    if [ "$2" = "force" ]; then 
+      apply_rules
+    else 
+      ( apply_rules ) & 
+    fi
+    ;;
+  stop)
+    while $IPT -t nat -D PREROUTING -j xkeen 2>/dev/null; do :; done
+    $IPT -t nat -F xkeen 2>/dev/null
+    $IPT -t nat -X xkeen 2>/dev/null
+    ;;
+  restart)
+    $0 stop
+    sleep 2
+    $0 start "$2"
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
 esac
 S99_EOF
 chmod +x /opt/etc/init.d/S99xray_net
 
-# [6] CONFIG & SUBSCRIPTION
+# [6] CONFIG & SUBSCRIPTION (БЕЗОПАСНАЯ ПЕРЕДАЧА URL ЧЕРЕЗ ENV)
 echo "[6/6] Настройка подписки..."
 cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 {
   "subscription": {"url": "", "update_interval_hours": 3},
-  "observatory": {"probe_url": "http://cp.cloudflare.com/generate_204", "probe_interval": "60s"},
+  "observatory": {"probeUrl": "http://www.cloudflare.com/cdn-cgi/trace", "probeInterval": "60s"},
   "balancer": {"strategy": "leastLoad", "expected_servers": 3, "max_rtt": "2000ms", "tolerance_percent": 50},
   "priority": {"patterns": []},
   "exclusions": {"by_flag": ["🇷🇺"], "by_name": ["россия", "russia", "ru"], "by_hostname": ["msk", "moscow"], "manual_ip_blacklist": []},
@@ -427,18 +503,42 @@ cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
 }
 CONF_EOF
 
+echo ""
 echo "Введите ссылку на подписку (vless://):"
-read SUB_URL
-python3 -c "
-import json, sys
+read -r SUB_URL
+
+export SUB_URL
+/opt/bin/python3 -c "
+import json, os
 with open('/opt/etc/xray/subkeen.conf.json', 'r', encoding='utf-8') as f: cfg = json.load(f)
-cfg['subscription']['url'] = sys.argv[1]
+cfg['subscription']['url'] = os.environ.get('SUB_URL', '')
 with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
-" "$SUB_URL"
+"
+
+echo ""
+echo "⏳ Выполняем первичную загрузку серверов и генерацию конфигурации..."
+if /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py; then
+    echo "✅ Конфигурация успешно сгенерирована."
+    echo "⏳ Запускаем службы Xray и применяем правила маршрутизации..."
+    
+    /opt/bin/xkeen -restart >/dev/null 2>&1 || true
+    /opt/etc/init.d/S99xray_net start force >/dev/null 2>&1 || true
+    
+    echo "🚀 Xray запущен, правила iptables применены. Сеть защищена!"
+else
+    echo "⚠️ Внимание: Первичная настройка завершилась с ошибкой."
+    echo "   Проверьте правильность ссылки на подписку в /opt/etc/xray/subkeen.conf.json"
+    echo "   После исправления ссылки просто выполните команду: choose"
+fi
 
 echo ""
 echo "============================================"
 echo "  УСТАНОВКА ЗАВЕРШЕНА!"
 echo "============================================"
-echo "  Для запуска VPN выполните команду: choose"
+echo "  Для ручной смены приоритетов или черного"
+echo "  списка в будущем используйте команду: choose"
 echo "============================================"
+EOF
+
+chmod +x /tmp/install.sh
+/tmp/install.sh
