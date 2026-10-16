@@ -5,19 +5,22 @@
 # Репозиторий: https://github.com/ofshor/xkeen-autoinstall
 #
 # Отличия от оригинала:
-#   1. /opt/tmp -> симлинк на /tmp (tmpfs, ОЗУ). Установщик XKeen
-#      распаковывает архив Xray ЦЕЛИКОМ (xray + geoip.dat +
-#      geosite.dat, ~50 МБ) в /opt/tmp/xray, после чего dat-файлы
-#      удаляются. На разделе 66 МБ этот транзиент переполняет UBIFS
-#      (внешне — «зависание»). Симлинк переносит транзиент в ОЗУ.
-#   2. Архив xkeen.tar.gz качается в /tmp, а не в текущий каталог.
-#   3. Чистка хвостов прошлых неудачных попыток до начала работы.
-#   4. Fail-fast проверка места + повтор распаковки при ENOSPC.
+#   1. Патч модуля установки Xray: распаковывается ТОЛЬКО бинарник
+#      (~28 МБ транзиента на /opt/tmp) вместо всего архива
+#      (xray + geoip.dat + geosite.dat, ~50 МБ). dat-файлы установщик
+#      всё равно удаляет после распаковки. На разделе 66 МБ полный
+#      unzip переполняет UBIFS (внешне — «зависание»/ребут).
+#   2. /opt/tmp остаётся РЕАЛЬНЫМ каталогом на накопителе. Проверено
+#      на практике: распаковка Xray в tmpfs + mv на NAND роняет
+#      роутер (пиковое давление памяти при кросс-ФС копировании).
+#   3. Чистка хвостов прошлых попыток: stage-каталоги, .old, недокачанные
+#      архивы и НЕПОЛНЫЕ бинарники xray/mihomo (огрызок после прерванной
+#      записи внешне «установлен», но падает Segmentation fault).
+#   4. Архив xkeen.tar.gz качается в /tmp (ОЗУ), fail-fast проверка места.
 #   5. TMPDIR=/tmp для opkg-фазы внутри xkeen -i.
-#   6. Ввод меню читается с /dev/tty: при `curl | sh` stdin занят
-#      самим скриптом, и read «съедал» его строки, ломая парсер.
-#      Финальный exec тоже получает /dev/tty, иначе меню xkeen
-#      зацикливается на EOF пайпа.
+#   6. Ввод меню читается с /dev/tty: при `curl | sh` stdin занят самим
+#      скриптом, и read «съедал» его строки, ломая парсер. Финальный
+#      exec тоже получает /dev/tty, иначе меню xkeen зациклится на EOF.
 # ============================================================
 
 green="\033[92m"
@@ -44,6 +47,13 @@ xkeen_config="/opt/etc/xkeen/xkeen.json"
 # ---------------------------------------------------------------------------
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}' | tr -dc '0-9'
+}
+
+# ---------------------------------------------------------------------------
+# Размер файла в байтах (0, если прочитать не удалось)
+# ---------------------------------------------------------------------------
+file_size() {
+    wc -c < "$1" 2>/dev/null || echo 0
 }
 
 # ---------------------------------------------------------------------------
@@ -85,36 +95,24 @@ read_from_tty() {
 }
 
 # ---------------------------------------------------------------------------
-# Ключевая правка для малого накопителя (см. шапку).
-# Идемпотентно: повторный запуск увидит симлинк и пропустит шаг.
-# Существующее содержимое /opt/tmp переносится в /tmp — там временные
-# файлы, потеря которых при перезагрузке безопасна.
-# После переустановки Entware симлинк нужно создать заново.
+# /opt/tmp должен быть РЕАЛЬНЫМ каталогом на накопителе.
+# Установщик XKeen распаковывает Xray в /opt/tmp/xray. Проверено на
+# роутерах этого класса: tmpfs-распаковка + mv 28 МБ на NAND роняет
+# систему, распаковка прямо на накопитель проходит штатно.
+# Если от прошлых экспериментов остался симлинк — заменяем на каталог.
 # ---------------------------------------------------------------------------
-prepare_opt_tmp() {
+ensure_opt_tmp_dir() {
     if [ -L /opt/tmp ]; then
-        return 0
-    fi
-
-    if [ -d /opt/tmp ]; then
-        if [ -n "$(ls -A /opt/tmp 2>/dev/null)" ]; then
-            _ott_backup="/tmp/opt-tmp-backup.$$"
-            mkdir -p "$_ott_backup" 2>/dev/null
-            find /opt/tmp -mindepth 1 -maxdepth 1 -exec mv {} "$_ott_backup"/ \; 2>/dev/null
-            printf "  ${yellow}Содержимое${reset} /opt/tmp перемещено в ${light_blue}%s${reset}\n" "$_ott_backup"
-        fi
-        rmdir /opt/tmp 2>/dev/null || rm -rf /opt/tmp
-    elif [ -e /opt/tmp ]; then
         rm -f /opt/tmp
+        printf "  ${yellow}Симлинк${reset} /opt/tmp -> /tmp заменён на реальный каталог\n"
+        printf "  (распаковка Xray надёжнее на накопителе, чем в tmpfs)\n"
     fi
-
-    if ! ln -s /tmp /opt/tmp; then
-        printf "  ${red}Ошибка${reset}: не удалось создать симлинк ${yellow}/opt/tmp -> /tmp${reset}\n"
-        exit 1
+    if [ ! -d /opt/tmp ]; then
+        mkdir -p /opt/tmp || {
+            printf "  ${red}Ошибка${reset}: не удалось создать каталог ${yellow}/opt/tmp${reset}\n"
+            exit 1
+        }
     fi
-
-    printf "  ${green}/opt/tmp${reset} перенесён в ${light_blue}tmpfs${reset} (ОЗУ)\n"
-    printf "  Транзиент установки Xray (~50 МБ) больше не занимает накопитель\n\n"
     return 0
 }
 
@@ -370,8 +368,8 @@ cleanup_stale
 # 2) Проверяем доступность репозитория Entware
 check_entware_repo
 
-# 3) Транзиент установки — в ОЗУ (ключевая правка, см. шапку)
-prepare_opt_tmp
+# 3) /opt/tmp — реальный каталог на накопителе (см. комментарий к функции)
+ensure_opt_tmp_dir
 
 # 4) Контроль свободного места на накопителе (fail-fast)
 avail_kb=$(free_kb /opt)
@@ -387,14 +385,6 @@ if [ -n "$avail_kb" ]; then
         printf "  ${yellow}Внимание${reset}: свободно ${yellow}%d МБ${reset} из ~45 МБ, необходимых для установки\n" $((avail_kb / 1024))
         echo
     fi
-fi
-
-# 5) Бюджет tmpfs: пик фазы Xray ~65-70 МБ (zip ~15 + распаковка ~50)
-tmp_free_kb=$(free_kb /tmp)
-case "$tmp_free_kb" in ''|*[!0-9]*) tmp_free_kb="" ;; esac
-if [ -n "$tmp_free_kb" ] && [ "$tmp_free_kb" -lt 71680 ]; then
-    printf "  ${yellow}Внимание${reset}: в /tmp (ОЗУ) свободно ~%d МБ, пик установки Xray ~65-70 МБ\n" $((tmp_free_kb / 1024))
-    printf "  При нехватке tmpfs установка может упасть или уйти в swap (медленно)\n\n"
 fi
 
 # Проверяем наличие пользовательского прокси в конфиге
@@ -512,7 +502,7 @@ if ! verify_install_sha256 "$archive_path" "$url"; then
     exit 1
 fi
 
-# 6) Распаковка на накопитель (модули XKeen ~3 МБ). Архив в этот момент
+# 5) Распаковка на накопитель (модули XKeen ~3 МБ). Архив в этот момент
 #    в ОЗУ. При ENOSPC снимаем весь балласт со старой установки и повторяем.
 stage_dir="/opt/sbin/.xkeen-install.$$"
 rm -rf "$stage_dir"
@@ -549,7 +539,7 @@ fi
 rm -f "$archive_path" 2>/dev/null
 sync
 
-# 7) Перенос в рабочие пути (переименования внутри одного раздела)
+# 6) Перенос в рабочие пути (переименования внутри одного раздела)
 chmod +x "$stage_dir/xkeen"
 if ! mv "$stage_dir/xkeen" /opt/sbin/xkeen.new; then
     cleanup_runtime
@@ -576,9 +566,37 @@ fi
 rm -f /opt/sbin/xkeen.old
 rm -rf /opt/sbin/.xkeen.old "$stage_dir"
 stage_dir=""
+
+# 7) Патч модуля установки Xray: распаковывать ТОЛЬКО бинарник.
+#    Полный unzip архива (xray + geoip.dat + geosite.dat, ~50 МБ транзиента
+#    в /opt/tmp/xray) переполняет малый раздел; dat-файлы установщик всё
+#    равно удаляет после распаковки. Патч переживает этот запуск; при
+#    обновлениях XKeen (самообновление модулей) применяется снова отсюда.
+XRAY_INSTALL_SH="/opt/sbin/.xkeen/02_install/02_install_xray.sh"
+if [ -f "$XRAY_INSTALL_SH" ] && grep -q 'unzip -q "$xray_archive" -d "$xtmp_dir"' "$XRAY_INSTALL_SH"; then
+    sed -i 's|unzip -q "$xray_archive" -d "$xtmp_dir"|unzip -q "$xray_archive" "xray" -d "$xtmp_dir"|' "$XRAY_INSTALL_SH" 2>/dev/null
+    if grep -q 'unzip -q "$xray_archive" "xray" -d "$xtmp_dir"' "$XRAY_INSTALL_SH"; then
+        printf "  ${green}Патч применён${reset}: распаковка Xray только бинарника (экономия ~20 МБ транзиента)\n"
+    fi
+fi
+
+# 8) Огрызки бинарников от прерванных установок: файл существует, но
+#    обрезан (смерть во время записи на NAND). Установщик увидит файл,
+#    решит, что ядро готово, и упадёт на его запуске (Segmentation fault).
+#    Полный Xray ~28 МБ, Mihomo ~20+ МБ — всё, что заметно меньше, брак.
+for _stale_bin in /opt/sbin/xray /opt/sbin/mihomo; do
+    if [ -f "$_stale_bin" ]; then
+        _sb_size=$(file_size "$_stale_bin")
+        case "$_sb_size" in ''|*[!0-9]*) _sb_size=0 ;; esac
+        if [ "$_sb_size" -lt 15000000 ]; then
+            rm -f "$_stale_bin"
+            printf "  ${yellow}Удалён${reset} неполный бинарник %s (%d КБ)\n" "$_stale_bin" $((_sb_size / 1024))
+        fi
+    fi
+done
 sync
 
-# 8) Перед самым тяжёлым этапом выгружаем с накопителя необязательное:
+# 9) Перед самым тяжёлым этапом выгружаем с накопителя необязательное:
 #    кэш opkg, временные каталоги opkg, устаревшие списки пакетов
 #    (xkeen -i всё равно выполнит opkg update и скачает свежие)
 rm -rf /opt/var/cache/opkg/* 2>/dev/null
@@ -586,13 +604,14 @@ rm -rf /opt/tmp/opkg-* 2>/dev/null
 rm -rf /opt/var/opkg-lists/* 2>/dev/null
 sync
 
-# 9) Памятка перед передачей управления штатному установщику
+# 10) Памятка перед передачей управления штатному установщику
 printf "  ${yellow}Памятка для накопителя малого объёма${reset}\n"
 printf "  В меню установщика:\n"
 printf "    - Mihomo — ${red}откажитесь${reset} (требует ~86 МБ, не поместится)\n"
-printf "    - GeoFile (geoip/geosite, ~20 МБ на накопителе) — откажитесь, если\n"
-printf "      правила geosite:/geoip: не используются; доустановить можно позже\n"
-printf "      повторным запуском ${light_blue}xkeen -i${reset}\n\n"
+printf "    - GeoFile (geoip/geosite, ~20 МБ) — можно ставить, если после\n"
+printf "      установки ${light_blue}df -k /opt${reset} показывает запас; иначе откажитесь\n\n"
+printf "  Пауза на этапе «Установка Xray» — это запись ~28 МБ на накопитель,\n"
+printf "  она может занять несколько минут. Не прерывайте!\n\n"
 printf "  Запуск штатного установщика XKeen...\n\n"
 
 # Временные файлы opkg (.ipk, каталоги распаковки) — в ОЗУ
