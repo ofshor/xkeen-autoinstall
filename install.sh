@@ -1,669 +1,579 @@
-cat << 'EOF' > /tmp/install.sh
 #!/bin/sh
 # ============================================================
-# Автоустановка Xray/XKeen на Keenetic (Heavy Mode) v10.9.3
-# СТАТУС: Ultimate Safe Fixed. Исправлены массивы в streamSettings и KeyError.
+# XKeen autoinstall (на основе install.sh jameszeroX/XKeen)
+# Вариант для накопителей малого объёма (~66 МБ свободно)
+# Репозиторий: https://github.com/ofshor/xkeen-autoinstall
+#
+# Отличия от оригинала:
+#   1. /opt/tmp -> симлинк на /tmp (tmpfs, ОЗУ). Установщик XKeen
+#      распаковывает архив Xray ЦЕЛИКОМ (xray + geoip.dat +
+#      geosite.dat, ~50 МБ) в /opt/tmp/xray, после чего dat-файлы
+#      удаляются. На разделе 66 МБ этот транзиент переполняет UBIFS
+#      (внешне — «зависание»). Симлинк переносит транзиент в ОЗУ.
+#   2. Архив xkeen.tar.gz качается в /tmp, а не в текущий каталог.
+#   3. Чистка хвостов прошлых неудачных попыток до начала работы.
+#   4. Fail-fast проверка места + повтор распаковки при ENOSPC.
+#   5. TMPDIR=/tmp для opkg-фазы внутри xkeen -i.
 # ============================================================
-set -e
 
-echo "============================================"
-echo "  XKeen + SubKeen Auto-Install v10.9.3"
-echo "============================================"
+green="\033[92m"
+red="\033[91m"
+yellow="\033[93m"
+light_blue="\033[96m"
+italic="\033[3m"
+reset="\033[0m"
 
-if [ "$(id -u)" != "0" ]; then echo "ОШИБКА: запускать от root"; exit 1; fi
-if [ ! -f /opt/bin/opkg ]; then echo "ОШИБКА: Entware не установлен"; exit 1; fi
-if ! command -v curl >/dev/null 2>&1; then
-    echo "ОШИБКА: curl не установлен! Выполните: opkg update && opkg install curl"
+url_stable="https://github.com/jameszeroX/XKeen/releases/latest/download/xkeen.tar.gz"
+url_beta="https://raw.githubusercontent.com/jameszeroX/XKeen/main/test/xkeen.tar.gz"
+archive_name="xkeen.tar.gz"
+
+# Архив всегда качаем в /tmp (tmpfs в ОЗУ) — на накопителе он не появляется
+archive_path="/tmp/${archive_name}"
+
+# Каталог распаковки; используется trap-уборкой при прерывании
+stage_dir=""
+
+xkeen_config="/opt/etc/xkeen/xkeen.json"
+
+# ---------------------------------------------------------------------------
+# Свободное место (КБ) на файловой системе, где расположен путь
+# ---------------------------------------------------------------------------
+free_kb() {
+    df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}' | tr -dc '0-9'
+}
+
+# ---------------------------------------------------------------------------
+# Хвосты прерванных прошлых установок — скрытый пожиратель места.
+# .xkeen.stage.* — stage-каталоги самого установщика XKeen (03_install_xkeen.sh)
+# ---------------------------------------------------------------------------
+cleanup_stale() {
+    rm -rf /opt/sbin/.xkeen-install.* 2>/dev/null
+    rm -rf /opt/sbin/.xkeen.stage.* 2>/dev/null
+    rm -f  /opt/sbin/xkeen.old /opt/sbin/xkeen.new 2>/dev/null
+    rm -f  /tmp/xkeen.tar.gz /tmp/xkeen.tar.gz.sha256ref.* 2>/dev/null
+    sync
+}
+
+# ---------------------------------------------------------------------------
+# Уборка за текущим запуском (ошибки, Ctrl+C / TERM)
+# ---------------------------------------------------------------------------
+cleanup_runtime() {
+    rm -f "${archive_path}".sha256ref.* "$archive_path" 2>/dev/null
+    [ -n "$stage_dir" ] && rm -rf "$stage_dir" 2>/dev/null
+    return 0
+}
+trap cleanup_runtime INT TERM
+
+# ---------------------------------------------------------------------------
+# Ключевая правка для малого накопителя (см. шапку).
+# Идемпотентно: повторный запуск увидит симлинк и пропустит шаг.
+# Существующее содержимое /opt/tmp переносится в /tmp — там временные
+# файлы, потеря которых при перезагрузке безопасна.
+# После переустановки Entware симлинк нужно создать заново.
+# ---------------------------------------------------------------------------
+prepare_opt_tmp() {
+    if [ -L /opt/tmp ]; then
+        return 0
+    fi
+
+    if [ -d /opt/tmp ]; then
+        if [ -n "$(ls -A /opt/tmp 2>/dev/null)" ]; then
+            _ott_backup="/tmp/opt-tmp-backup.$$"
+            mkdir -p "$_ott_backup" 2>/dev/null
+            find /opt/tmp -mindepth 1 -maxdepth 1 -exec mv {} "$_ott_backup"/ \; 2>/dev/null
+            printf "  ${yellow}Содержимое${reset} /opt/tmp перемещено в ${light_blue}%s${reset}\n" "$_ott_backup"
+        fi
+        rmdir /opt/tmp 2>/dev/null || rm -rf /opt/tmp
+    elif [ -e /opt/tmp ]; then
+        rm -f /opt/tmp
+    fi
+
+    if ! ln -s /tmp /opt/tmp; then
+        printf "  ${red}Ошибка${reset}: не удалось создать симлинк ${yellow}/opt/tmp -> /tmp${reset}\n"
+        exit 1
+    fi
+
+    printf "  ${green}/opt/tmp${reset} перенесён в ${light_blue}tmpfs${reset} (ОЗУ)\n"
+    printf "  Транзиент установки Xray (~50 МБ) больше не занимает накопитель\n\n"
+    return 0
+}
+
+# Функция для вывода справки
+show_help() {
+echo
+echo -e "  ${yellow}Использование${reset}: $0 [ОПЦИИ]"
+echo
+echo -e "  ${yellow}Опции${reset}"
+echo -e "    -s, --stable	${italic}Установить стабильную версию${reset}"
+echo -e "    -b, --beta		${italic}Установить бета-версию${reset}"
+echo -e "    -l, --legacy ВЕРСИЯ	${italic}Установить предыдущую версию (например, 1.1.3.9)${reset}"
+echo -e "    -h, --help		${italic}Показать эту справку${reset}"
+echo
+echo -e "  ${yellow}Примеры${reset}"
+echo  "    $0 --stable"
+echo  "    $0 --beta"
+echo  "    $0 --legacy 1.1.3.9"
+echo  "    $0 --help"
+echo  "    curl -sSL https://raw.githubusercontent.com/ofshor/xkeen-autoinstall/main/install.sh | sh -s -- --stable"
+}
+
+# Дубль функции из scripts/_xkeen/01_info/01_info_common.sh
+strip_json_comments() {
+    awk '
+    {
+        line = ""; i = 1; n = length($0); instr = 0; esc = 0
+        while (i <= n) {
+            c = substr($0, i, 1)
+            if (inblk) {
+                if (c == "*" && substr($0, i + 1, 1) == "/") { inblk = 0; i += 2 } else i++
+                continue
+            }
+            if (instr) {
+                line = line c
+                if (esc) esc = 0
+                else if (c == "\\") esc = 1
+                else if (c == "\"") instr = 0
+                i++
+                continue
+            }
+            if (c == "\"") { instr = 1; line = line c; i++; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "*") { inblk = 1; i += 2; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "/") break
+            line = line c; i++
+        }
+        print line
+    }' "$@"
+}
+
+# Функция извлечения пользовательского прокси из /opt/etc/xkeen/xkeen.json
+get_user_proxy() {
+    gh_proxy_user=""
+    [ ! -f "$xkeen_config" ] && return 1
+
+    gh_proxy_user=$(strip_json_comments "$xkeen_config" | \
+        sed -n 's/.*"gh_proxy"[[:space:]]*: *"\([^"]*\)".*/\1/p' | \
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' 2>/dev/null)
+
+    [ "$gh_proxy_user" = "null" ] && gh_proxy_user=""
+    [ -z "$gh_proxy_user" ] && return 1
+
+    gh_proxy_user="${gh_proxy_user%/}"
+    return 0
+}
+
+# Функция проверки доступности версии
+check_version_available() {
+    local test_url="$1"
+    curl -sI -f --connect-timeout 3 -m 7 "$test_url" >/dev/null && return 0
+
+    if [ -n "$gh_proxy_user" ]; then
+        curl -sI -f --connect-timeout 3 -m 7 "$gh_proxy_user/$test_url" >/dev/null && return 0
+    fi
+
+    curl -sI -f --connect-timeout 3 -m 7 "https://gh-proxy.com/$test_url" >/dev/null || \
+    curl -sI -f --connect-timeout 3 -m 7 "https://ghfast.top/$test_url" >/dev/null
+}
+
+# Функция загрузки XKeen (архив пишется в $archive_path — tmpfs)
+download_xkeen_release() {
+    if curl -fLo "$archive_path" --connect-timeout 10 -m 60 "$1"; then
+        return 0
+    fi
+
+    if [ -n "$gh_proxy_user" ] && curl -fLo "$archive_path" --connect-timeout 10 -m 60 "$gh_proxy_user/$1"; then
+        return 0
+    fi
+
+    if curl -fLo "$archive_path" --connect-timeout 10 -m 60 "https://gh-proxy.com/$1"; then
+        return 0
+    fi
+
+    if curl -fLo "$archive_path" --connect-timeout 10 -m 60 "https://ghfast.top/$1"; then
+        return 0
+    fi
+
+    printf "  ${red}Ошибка${reset}: не удалось загрузить ${yellow}xkeen.tar.gz${reset}\n"
+    return 1
+}
+
+# Best-effort проверка SHA-256 через GitHub Releases API.
+# На чистой установке jq отсутствует — предупреждение и пропуск.
+verify_install_sha256() {
+    _vis_file="$1"
+    _vis_url="$2"
+    _vis_asset=$(basename "$_vis_url")
+
+    _vis_api_url=$(printf '%s' "$_vis_url" | \
+        sed -n 's#^https://github\.com/\([^/]*\)/\([^/]*\)/releases/download/\([^/]*\)/.*#https://api.github.com/repos/\1/\2/releases/tags/\3#p')
+    if [ -z "$_vis_api_url" ]; then
+        _vis_api_url=$(printf '%s' "$_vis_url" | \
+            sed -n 's#^https://github\.com/\([^/]*\)/\([^/]*\)/releases/latest/download/.*#https://api.github.com/repos/\1/\2/releases/latest#p')
+    fi
+
+    [ -z "$_vis_api_url" ] && return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        printf "  ${yellow}Предупреждение${reset}: jq не установлен, проверка контрольной суммы ${light_blue}SHA-256${reset} пропущена\n"
+        return 0
+    fi
+
+    _vis_ref="${_vis_file}.sha256ref.$$"
+    if ! curl -fLsS --connect-timeout 10 -m 15 -o "$_vis_ref" "$_vis_api_url"; then
+        if [ -n "$gh_proxy_user" ] && curl -fLsS --connect-timeout 10 -m 15 -o "$_vis_ref" "$gh_proxy_user/$_vis_api_url"; then
+            :
+        elif curl -fLsS --connect-timeout 10 -m 15 -o "$_vis_ref" "https://gh-proxy.com/$_vis_api_url"; then
+            :
+        elif curl -fLsS --connect-timeout 10 -m 15 -o "$_vis_ref" "https://ghfast.top/$_vis_api_url"; then
+            :
+        else
+            rm -f "$_vis_ref"
+            printf "  ${yellow}Предупреждение${reset}: GitHub API недоступен, проверка контрольной суммы ${light_blue}SHA-256${reset} пропущена\n"
+            return 0
+        fi
+    fi
+
+    _vis_expected=$(jq -r --arg asset "$_vis_asset" '.assets[]? | select(.name == $asset) | .digest // ""' "$_vis_ref" 2>/dev/null | head -n 1)
+    rm -f "$_vis_ref"
+
+    case "$_vis_expected" in
+        sha256:*) _vis_expected="${_vis_expected#sha256:}" ;;
+    esac
+
+    case "$_vis_expected" in
+        [0-9a-fA-F][0-9a-fA-F]*) ;;
+        *)
+            printf "  ${yellow}Предупреждение${reset}: контрольная сумма ${light_blue}SHA-256${reset} не найдена в GitHub API, проверка пропущена\n"
+            return 0
+            ;;
+    esac
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        printf "  ${yellow}Предупреждение${reset}: sha256sum не установлен, проверка контрольной суммы ${light_blue}SHA-256${reset} пропущена\n"
+        return 0
+    fi
+
+    _vis_actual=$(sha256sum "$_vis_file" 2>/dev/null | awk '{print $1}')
+    if [ "$_vis_actual" = "$_vis_expected" ]; then
+        printf "  Контрольная сумма ${light_blue}SHA-256${reset} файла %s ${green}проверена${reset}\n" "$_vis_asset"
+        return 0
+    fi
+
+    printf "  ${red}Ошибка${reset}: контрольная сумма ${light_blue}SHA-256${reset} файла %s не совпала с ожидаемой\n" "$_vis_asset"
+    return 1
+}
+
+download_with_check() {
+    url="$1"
+    output_file="$2"
+    min_size="${3:-50000}"
+
+    curl --connect-timeout 5 -m 15 -y 1000 -Y 5 -s -L "$url" -o "$output_file" 2>/dev/null
+
+    if [ -f "$output_file" ]; then
+        size=$(wc -c < "$output_file" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$min_size" ]; then
+            if head -c 100 "$output_file" 2>/dev/null | grep -iqE '^(<!doctype|<html|<head|<body|404|error|not found)'; then
+                rm -f "$output_file" 2>/dev/null
+                return 1
+            fi
+            return 0
+        fi
+    fi
+
+    rm -f "$output_file" 2>/dev/null
+    return 1
+}
+
+check_entware_repo() {
+    printf "  ${yellow}Проверка готовности${reset} к установке. Пожалуйста, подождите...\n"
+
+    repo_url=$(awk '/^src/ {print $3; exit}' /opt/etc/opkg.conf 2>/dev/null)
+
+    if [ -z "$repo_url" ]; then
+        printf "  ${red}Не удалось${reset} определить используемый репозиторий Entware\n"
+        printf "  Проверьте файл ${yellow}/opt/etc/opkg.conf${reset}\n"
+        exit 1
+    fi
+
+    tmp_file="/tmp/pkg_check_$$"
+
+    if download_with_check "$repo_url/Packages.gz" "$tmp_file"; then
+        rm -f "$tmp_file" 2>/dev/null
+        clear && echo
+        return 0
+    fi
+
+    rm -f "$tmp_file" 2>/dev/null
+    printf "  Репозиторий Entware ${red}недоступен${reset}\n"
+    printf "  Установка ${red}прервана${reset}. Выберите рабочее зеркало по ссылке ${light_blue}https://entware.net/mirrors.html${reset}\n"
+    printf "  и укажите его в файле ${yellow}/opt/etc/opkg.conf${reset}, после чего запустите установку повторно\n"
+    exit 1
+}
+
+# Парсинг аргументов командной строки
+VERSION_TYPE=""
+LEGACY_VERSION=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--stable)
+            VERSION_TYPE="stable"
+            shift
+            ;;
+        -b|--beta)
+            VERSION_TYPE="beta"
+            shift
+            ;;
+        -l|--legacy)
+            VERSION_TYPE="legacy"
+            LEGACY_VERSION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            printf "  ${red}Неизвестный параметр${reset}: $1\n"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+[ -t 1 ] && clear
+echo
+
+# 1) Чистим хвосты прошлых неудачных попыток
+cleanup_stale
+
+# 2) Проверяем доступность репозитория Entware
+check_entware_repo
+
+# 3) Транзиент установки — в ОЗУ (ключевая правка, см. шапку)
+prepare_opt_tmp
+
+# 4) Контроль свободного места на накопителе (fail-fast)
+avail_kb=$(free_kb /opt)
+case "$avail_kb" in ''|*[!0-9]*) avail_kb="" ;; esac
+if [ -n "$avail_kb" ]; then
+    if [ "$avail_kb" -lt 15360 ]; then
+        printf "  ${red}Недостаточно места${reset}: свободно ${yellow}%d КБ${reset}\n" "$avail_kb"
+        printf "  Стационарно установка займёт ~40-45 МБ (Xray ~30 + пакеты ~9 + модули ~3)\n"
+        printf "  Освободите место на накопителе и запустите установку повторно\n"
+        echo
+        exit 1
+    elif [ "$avail_kb" -lt 46080 ]; then
+        printf "  ${yellow}Внимание${reset}: свободно ${yellow}%d МБ${reset} из ~45 МБ, необходимых для установки\n" $((avail_kb / 1024))
+        echo
+    fi
+fi
+
+# 5) Бюджет tmpfs: пик фазы Xray ~65-70 МБ (zip ~15 + распаковка ~50)
+tmp_free_kb=$(free_kb /tmp)
+case "$tmp_free_kb" in ''|*[!0-9]*) tmp_free_kb="" ;; esac
+if [ -n "$tmp_free_kb" ] && [ "$tmp_free_kb" -lt 71680 ]; then
+    printf "  ${yellow}Внимание${reset}: в /tmp (ОЗУ) свободно ~%d МБ, пик установки Xray ~65-70 МБ\n" $((tmp_free_kb / 1024))
+    printf "  При нехватке tmpfs установка может упасть или уйти в swap (медленно)\n\n"
+fi
+
+# Проверяем наличие пользовательского прокси в конфиге
+if get_user_proxy; then
+    printf "  Используется ${green}пользовательский прокси${reset}: ${yellow}%s${reset}\n\n" "$gh_proxy_user"
+fi
+
+# Если параметры не переданы, показываем интерактивное меню
+if [ -z "$VERSION_TYPE" ]; then
+    while true; do
+        printf "  Какую версию ${yellow}XKeen${reset} вы хотите установить?\n\n"
+        printf "  1) Стабильную версию (${light_blue}Stable${reset})\n"
+        printf "  2) Новую Бета-версию (${light_blue}Beta${reset})\n"
+        printf "  3) Предыдущую версию (${light_blue}Legacy${reset})\n\n"
+        printf "  0) Отмена\n\n"
+        printf "  Выберите пункт меню [по умолчанию 1]: "
+        read -r version_choice
+
+        [ -z "$version_choice" ] && version_choice=1
+
+        case "$version_choice" in
+            0)
+                printf "\n  Установка отменена.\n"
+                exit 0
+                ;;
+            1)
+                url="$url_stable"
+                echo
+                printf "  Выбрана ${light_blue}Стабильная версия${reset}\n"
+                break
+                ;;
+            2)
+                url="$url_beta"
+                echo
+                printf "  Выбрана ${light_blue}Бета-версия${reset}\n"
+                break
+                ;;
+            3)
+                echo
+                while true; do
+                    printf "  ${red}Внимание!${reset}\n  Предыдущие версии могут быть несовместимы с новыми прошивками\n"
+                    printf "  Продолжайте только если уверены в том, что делаете\n\n"
+                    printf "  Введите интересующую версию XKeen (например, ${light_blue}1.1.3.9${reset} или ${light_blue}0${reset} для выхода): "
+                    read -r legacy_version
+
+                    if [ -z "$legacy_version" ]; then
+                        printf "  ${red}Ошибка${reset}: версия не может быть пустой.\n\n"
+                        continue
+                    fi
+
+                    [ "$legacy_version" = 0 ] && exit 0
+
+                    url="https://github.com/jameszeroX/XKeen/releases/download/${legacy_version}/xkeen.tar.gz"
+
+                    printf "  Проверяем доступность версии ${yellow}%s${reset}...\n" "$legacy_version"
+
+                    if check_version_available "$url"; then
+                        break 2
+                    else
+                        printf "  ${red}Ошибка${reset}: версия ${yellow}%s${reset} не найдена в репозитории или недоступна.\n\n" "$legacy_version"
+                    fi
+                done
+                ;;
+            *)
+                [ -t 1 ] && clear
+                printf "\n  ${red}Неверный выбор.${reset} Пожалуйста, выберите пункт от 0 до 3.\n\n"
+                ;;
+        esac
+    done
+else
+    case "$VERSION_TYPE" in
+        stable)
+            url="$url_stable"
+            printf "  Выбрана ${light_blue}Стабильная версия${reset} (автоматическая установка)\n"
+            ;;
+        beta)
+            url="$url_beta"
+            printf "  Выбрана ${light_blue}Бета-версия${reset} (автоматическая установка)\n"
+            ;;
+        legacy)
+            if [ -z "$LEGACY_VERSION" ]; then
+                printf "  ${red}Ошибка${reset}: для параметра --legacy необходимо указать версию\n"
+                echo
+                show_help
+                exit 1
+            fi
+            url="https://github.com/jameszeroX/XKeen/releases/download/${LEGACY_VERSION}/xkeen.tar.gz"
+            printf "  Выбрана предыдущая версия ${yellow}%s${reset} (автоматическая установка)\n" "$LEGACY_VERSION"
+            printf "  Проверяем доступность версии ${yellow}%s${reset}...\n" "$LEGACY_VERSION"
+
+            if ! check_version_available "$url"; then
+                printf "  ${red}Ошибка${reset}: версия ${yellow}%s${reset} не найдена в репозитории или недоступна.\n" "$LEGACY_VERSION"
+                exit 1
+            fi
+            printf "  ${green}Версия найдена${reset}, продолжаем установку...\n"
+            ;;
+        *)
+            printf "  ${red}Неизвестный тип версии${reset}\n"
+            exit 1
+            ;;
+    esac
+fi
+
+echo
+
+if ! download_xkeen_release "$url"; then
+    cleanup_runtime
     exit 1
 fi
 
-FREE_MB=$(df /opt | tail -1 | awk '{print int($4/1024)}')
-if [ "$FREE_MB" -lt 20 ]; then echo "ОШИБКА: мало памяти (требуется минимум 20 МБ)"; exit 1; fi
-
-# [1] PACKAGES
-echo "[1/6] Установка пакетов..."
-opkg update >/dev/null 2>&1 || true
-for pkg in python3 curl iptables unzip ca-certificates; do
-    opkg list-installed 2>/dev/null | grep -q "^$pkg " || opkg install $pkg >/dev/null 2>&1 || true
-done
-
-# [2] XRAY & XKEEN
-echo "[2/6] Установка Xray и XKeen..."
-killall xray 2>/dev/null || true
-sleep 1
-cd /tmp
-
-ARCH=$(uname -m)
-case "$ARCH" in
-    aarch64) XRAY_ARCH="arm64-v8a" ;;
-    armv7l)  XRAY_ARCH="arm32-v7a" ;;
-    mips|mipsel)
-        if /opt/bin/python3 -c "import sys; sys.exit(0 if sys.byteorder == 'little' else 1)" 2>/dev/null; then
-            XRAY_ARCH="mips32le"
-        else
-            XRAY_ARCH="mips32"
-        fi ;;
-    *) echo "ОШИБКА: Неизвестная архитектура $ARCH"; exit 1 ;;
-esac
-echo "  Определена архитектура: $ARCH -> $XRAY_ARCH"
-
-curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.10.10/Xray-linux-${XRAY_ARCH}.zip" || \
-curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-${XRAY_ARCH}.zip" || \
-{ echo "ОШИБКА: Не удалось скачать Xray для архитектуры ${XRAY_ARCH}"; exit 1; }
-
-mkdir -p /opt/bin
-unzip -o xray.zip xray -d /opt/bin/ >/dev/null
-chmod +x /opt/bin/xray
-rm -f xray.zip
-
-/opt/bin/xray version >/dev/null 2>&1 || { echo "ОШИБКА: Бинарник xray не запускается"; exit 1; }
-
-curl -fsSL -o xkeen.tar.gz "https://github.com/jameszeroX/XKeen/releases/download/2.1/xkeen.tar.gz" || \
-{ echo "ОШИБКА: Не удалось скачать XKeen"; exit 1; }
-tar -xzf xkeen.tar.gz -C /opt/ >/dev/null
-rm -f xkeen.tar.gz
-chmod +x /opt/xkeen
-ln -sf /opt/xkeen /opt/bin/xkeen
-ln -sfn /opt/_xkeen /opt/bin/.xkeen
-
-# [3] CONFIGS
-echo "[3/6] Настройка конфигов..."
-mkdir -p /opt/etc/xray/configs
-cp -r /opt/_xkeen/02_install/08_install_configs/02_configs_xray/* /opt/etc/xray/configs/ 2>/dev/null || true
-
-cat > /opt/etc/xray/configs/02_dns.json << 'DNS_EOF'
-{ "dns": { "servers": ["1.1.1.1", "8.8.8.8"] } }
-DNS_EOF
-
-cat > /opt/etc/xray/configs/03_inbounds.json << 'IN_EOF'
-{
-  "inbounds": [
-    {
-      "tag": "redirect",
-      "port": 61219,
-      "protocol": "dokodemo-door",
-      "settings": { "network": "tcp", "followRedirect": true },
-      "sniffing": { "enabled": true, "routeOnly": true, "destOverride": ["http", "tls"] }
-    },
-    {
-      "tag": "tproxy",
-      "port": 61219,
-      "protocol": "dokodemo-door",
-      "settings": { "network": "udp", "followRedirect": true },
-      "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
-      "sniffing": { "enabled": true, "routeOnly": true, "destOverride": ["http", "tls"] }
-    }
-  ]
-}
-IN_EOF
-
-cat > /opt/etc/xray/configs/04_outbounds.json << 'OB_EOF'
-{
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
-}
-OB_EOF
-
-cat > /opt/etc/xray/configs/05_routing.json << 'ROUTING_EOF'
-{
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "network": "udp", "port": "135, 137, 138, 139" },
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "block", "domain": ["appcenter.ms"] },
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "outboundTag": "direct", "protocol": ["bittorrent"] },
-      { "type": "field", "inboundTag": ["redirect", "tproxy"], "balancerTag": "auto-balancer" }
-    ],
-    "balancers": [
-      {
-        "tag": "auto-balancer",
-        "selector": ["priority-", "proxy-"],
-        "strategy": { "type": "leastLoad", "settings": { "tolerance": 0.5, "expected": 3, "maxRTT": "2000ms" } }
-      }
-    ]
-  }
-}
-ROUTING_EOF
-
-cat > /opt/etc/xray/configs/06_policy.json << 'POL_EOF'
-{
-  "policy": {
-    "levels": {
-      "0": { "handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5, "bufferSize": 10240 }
-    }
-  }
-}
-POL_EOF
-
-cat > /opt/etc/xray/configs/07_observatory.json << 'OBS_EOF'
-{
-  "observatory": {
-    "subjectSelector": ["proxy-", "priority-"],
-    "probeUrl": "http://cp.cloudflare.com/generate_204",
-    "probeInterval": "60s"
-  }
-}
-OBS_EOF
-
-# [4] SCRIPTS
-echo "[4/6] Создание скриптов..."
-mkdir -p /opt/sbin/SubKeen-current
-
-cat > /opt/sbin/xkeen_geo.py << 'GEOEOF'
-import urllib.request, ssl, base64, json, socket, time, sys
-from urllib.parse import urlparse
-
-CACHE_TTL = 7 * 24 * 60 * 60
-
-def resolve_ip(hostname):
-    try:
-        return socket.gethostbyname(hostname)
-    except Exception:
-        try:
-            url = f"https://1.1.1.1/dns-query?name={hostname}&type=A"
-            req = urllib.request.Request(url, headers={'Accept': 'application/dns-json'})
-            ctx_doh = ssl.create_default_context()
-            ctx_doh.check_hostname = False
-            ctx_doh.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, context=ctx_doh, timeout=5) as r:
-                data = json.loads(r.read().decode())
-                for ans in data.get('Answer', []):
-                    if ans.get('type') == 1: return ans.get('data')
-        except Exception:
-            return None
-    return None
-
-def get_sub(url):
-    ctx = ssl.create_default_context()
-    for a in range(1, 4):
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url), context=ctx, timeout=30) as r:
-                body = r.read().decode(errors="replace").strip()
-            if body.startswith("vless://"):
-                return [l.strip() for l in body.split("\n") if l.strip().startswith("vless://")]
-            try:
-                decoded = base64.b64decode(body.replace("\n","")).decode(errors="replace")
-                return [l.strip() for l in decoded.split("\n") if l.strip().startswith("vless://")]
-            except Exception:
-                return [l.strip() for l in body.split("\n") if l.strip().startswith("vless://")]
-        except Exception as e:
-            print("Попытка %d/3: %s" % (a, e))
-            if a < 3: time.sleep(3)
-    sys.exit("Не удалось скачать подписку")
-
-def get_smart_geo_data(urls, config):
-    cache = config.get("geo_cache", {})
-    current_time = int(time.time())
-    resolved_data = {}; hostnames_to_api = []; results = {}
-    for u in urls:
-        try:
-            hostname = urlparse(u.replace("vless://", "http://", 1)).hostname
-            if not hostname: continue
-            ip = resolve_ip(hostname)
-            resolved_data[hostname] = ip
-            if hostname in cache:
-                cached = cache[hostname]
-                if cached.get("ip") == ip and (current_time - cached.get("timestamp", 0)) < CACHE_TTL:
-                    results[hostname] = cached["country"]
-                else: hostnames_to_api.append(hostname)
-            else: hostnames_to_api.append(hostname)
-        except: resolved_data[hostname] = None
-        
-    if hostnames_to_api:
-        ips_to_query = list(set([resolved_data[h] for h in hostnames_to_api if resolved_data[h]]))
-        if ips_to_query:
-            try:
-                data = json.dumps(ips_to_query).encode('utf-8')
-                # ДОБАВЛЕН User-Agent для обхода блокировки 403 от ip-api.com
-                headers = {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-                req = urllib.request.Request('https://ip-api.com/batch', data=data, headers=headers, method='POST')
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    api_results = json.loads(r.read().decode())
-                if isinstance(api_results, list):
-                    ip_to_country = {item['query']: item.get('countryCode', '??') for item in api_results if item.get('status') == 'success'}
-                else: ip_to_country = {}
-                for hostname in hostnames_to_api:
-                    ip = resolved_data[hostname]
-                    country = ip_to_country.get(ip, '??')
-                    cache[hostname] = {"ip": ip, "country": country, "timestamp": current_time}
-                    results[hostname] = country
-            except Exception as e:
-                print(f"  ⚠️ Ошибка API ({e}). Используем кэш.")
-                for hostname in hostnames_to_api:
-                    results[hostname] = cache.get(hostname, {}).get("country", "??")
-    
-    config["geo_cache"] = cache
-    return results, resolved_data, config
-GEOEOF
-chmod +x /opt/sbin/xkeen_geo.py
-
-cat > /opt/sbin/SubKeen-current/subkeen_multi.py << 'PYEOF'
-#!/usr/bin/env python3
-import sys, os, shutil, re, subprocess, json
-sys.path.insert(0, '/opt/sbin')
-import xkeen_geo
-from urllib.parse import urlparse, parse_qs, unquote
-
-CONF_FILE = "/opt/etc/xray/subkeen.conf.json"
-OB = "/opt/etc/xray/configs/04_outbounds.json"
-RT = "/opt/etc/xray/configs/05_routing.json"
-OBS = "/opt/etc/xray/configs/07_observatory.json"
-CONF_DIR = "/opt/etc/xray/configs"
-
-def load_config():
-    if not os.path.exists(CONF_FILE): sys.exit("Конфиг не найден: %s" % CONF_FILE)
-    with open(CONF_FILE, encoding='utf-8') as f: return json.load(f)
-
-def save_config(config):
-    tmp = CONF_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, CONF_FILE)
-
-def remove_json_comments(text):
-    text = re.sub(r'//.*$', '', text, flags=re.MULTILINE)
-    return re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-
-def load_jsonc(fp):
-    with open(fp, 'r', encoding='utf-8') as f: return json.loads(remove_json_comments(f.read()))
-
-def atomic_write_json(fp, d):
-    tmp = fp + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2, ensure_ascii=False); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, fp)
-
-def parse_vless(u, idx, cfg, geo_data, resolved_data):
-    d = urlparse(u.replace("vless://", "http://", 1)); q = parse_qs(d.query)
-    friendly_name = ""
-    if "#" in u:
-        try: friendly_name = unquote(u.split("#", 1)[1]).lower()
-        except: friendly_name = f"server_{idx:02d}"
-    else:
-        friendly_name = f"server_{idx:02d}"
-        
-    hostname = (d.hostname or "").lower()
-    excluded = False; excl_cfg = cfg.get("exclusions", {})
-    for flag in excl_cfg.get("by_flag", []):
-        if flag in friendly_name: excluded = True; break
-    if not excluded:
-        for name in excl_cfg.get("by_name", []):
-            if name.lower() in friendly_name: excluded = True; break
-    if not excluded:
-        for hp in excl_cfg.get("by_hostname", []):
-            if hp.lower() in hostname: excluded = True; break
-    is_priority = False
-    for pat in cfg.get("priority", {}).get("patterns", []):
-        if pat.lower() in friendly_name or pat.lower() in hostname: is_priority = True; break
-    if not excluded and not is_priority:
-        ip_blacklist = excl_cfg.get("manual_ip_blacklist", [])
-        current_ip = resolved_data.get(hostname)
-        if ip_blacklist and current_ip and current_ip in ip_blacklist: excluded = True
-        if not excluded and current_ip and geo_data.get(hostname, '??') == 'RU':
-            excluded = True; print(f"  [!] {hostname} авто-исключён (Россия)")
-            
-    tag = "excl-%02d" % idx if excluded else ("priority-%02d" % idx if is_priority else "proxy-%02d" % idx)
-    
-    # ИСПРАВЛЕНО v10.9.3: Безопасное извлечение строк из parse_qs с дефолтными значениями
-    sec = str(q.get("security", ["none"])[0])
-    net = str(q.get("type", ["tcp"])[0])
-    
-    ss = {}; ssn = None
-    if sec == "reality":
-        ssn = "realitySettings"
-        # ИСПРАВЛЕНО v10.9.3: Явное извлечение первого элемента и приведение к str
-        ss = {
-            "fingerprint": str(q.get("fp", ["chrome"])[0]), 
-            "publicKey": str(q.get("pbk", [""])[0]),
-            "serverName": str(q.get("sni", q.get("serverName", [""]))[0]), 
-            "shortId": str(q.get("sid", [""])[0])
-        }
-    elif sec == "tls":
-        ssn = "tlsSettings"
-        sni = str(q.get("sni", q.get("serverName", [""]))[0])
-        if sni: ss["serverName"] = sni
-        
-    ts = {}; tsn = "tcpSettings"
-    if net == "ws":
-        tsn = "wsSettings"
-        ts = {"path": str(q.get("path", ["/"])[0])}
-        host_val = q.get("host", [])
-        if host_val and len(host_val) > 0 and str(host_val[0]):
-            ts["headers"] = {"Host": str(host_val[0])}
-    elif net == "grpc":
-        tsn = "grpcSettings"
-        ts = {"serviceName": str(q.get("serviceName", [""])[0])}
-        
-    user = {"id": str(d.username), "encryption": "none"}
-    # ИСПРАВЛЕНО v10.9.3: Безопасная проверка наличия flow в словаре q
-    if "flow" in q: user["flow"] = str(q["flow"][0])
-    
-    out = {
-        "protocol": "vless", 
-        "settings": {"vnext": [{"address": str(d.hostname), "port": int(d.port), "users": [user]}]},
-        "streamSettings": {"network": net, "security": sec}, 
-        "tag": tag
-    }
-    if ssn: out["streamSettings"][ssn] = ss
-    if ts: out["streamSettings"][tsn] = ts
-    return out, excluded, is_priority
-
-def xray_test():
-    p = subprocess.run(["/opt/bin/xray", "run", "-test", "-confdir", CONF_DIR], capture_output=True, text=True)
-    if p.returncode == 0: print("  xray -test: OK"); return True
-    print("  xray -test FAIL:\n" + (p.stderr or p.stdout)); return False
-
-def main():
-    cfg = load_config(); sub_url = cfg["subscription"]["url"]
-    if not sub_url or sub_url == "ВСТАВЬТЕ_СЮДА_ВАШУ_ССЫЛКУ_НА_ПОДПИСКУ": 
-        sys.exit("URL подписки пуст или не настроен")
-    print("Скачиваем подписку..."); urls = xkeen_geo.get_sub(sub_url)
-    if not urls: sys.exit("Нет vless-серверов в подписке")
-    print("Smart Geo-Caching...")
-    
-    geo_data, resolved_data, cfg = xkeen_geo.get_smart_geo_data(urls, cfg)
-    
-    for f in (OB, RT, OBS):
-        if os.path.exists(f): shutil.copy2(f, f + ".bak")
-    
-    ob = load_jsonc(OB)
-    if isinstance(ob, list): ob = {"outbounds": ob}
-    if "outbounds" not in ob: ob["outbounds"] = []
-    ob["outbounds"] = [o for o in ob["outbounds"] if not str(o.get("tag","")).startswith(("proxy-","excl-","priority-"))]
-    
-    n_excl = n_pri = n_proxy = 0
-    for i, u in enumerate(urls):
-        out, ex, pri = parse_vless(u, i, cfg, geo_data, resolved_data)
-        if ex: n_excl += 1
-        elif pri: n_pri += 1
-        else: n_proxy += 1
-        ob["outbounds"].append(out)
-        
-    if n_pri + n_proxy == 0:
-        sys.exit("Все серверы исключены — проверьте подписку и настройки исключений!")
-        
-    atomic_write_json(OB, ob)
-    
-    rt = load_jsonc(RT)
-    if "routing" not in rt: rt["routing"] = {"rules": [], "balancers": []}
-    r = rt["routing"]
-    if "rules" not in r: r["rules"] = []
-        
-    r["balancers"] = [b for b in r.get("balancers", []) if b.get("tag") != "auto-balancer"]
-    bal_cfg = cfg.get("balancer", {})
-    r["balancers"].append({
-        "tag": "auto-balancer", "selector": ["priority-", "proxy-"],
-        "strategy": {"type": bal_cfg.get("strategy", "leastLoad"), "settings": {"tolerance": bal_cfg.get("tolerance", 0.5), "expected": bal_cfg.get("expected", 3), "maxRTT": bal_cfg.get("maxRTT", "2000ms")}}
-    })
-    
-    for rule in r.get("rules", []):
-        out_tag = rule.get("outboundTag")
-        if out_tag and out_tag not in ("direct", "block") and "balancerTag" not in rule:
-            rule["balancerTag"] = "auto-balancer"
-            if "outboundTag" in rule: del rule["outboundTag"]
-            
-    atomic_write_json(RT, rt)
-    save_config(cfg)
-    
-    print(f"Результат: приоритетных {n_pri}, обычных {n_proxy}, исключено {n_excl}")
-    if not xray_test(): 
-        print("ОТКАТ: Конфиг не прошёл тест. Восстанавливаем бэкапы...")
-        for f in (OB, RT, OBS):
-            if os.path.exists(f + ".bak"): shutil.copy2(f + ".bak", f)
-        subprocess.run(["/opt/bin/xkeen", "-restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        sys.exit(1)
-        
-    subprocess.run(["/opt/bin/xkeen", "-restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    
-    interval = cfg["subscription"].get("update_interval_hours", 1)
-    os.makedirs("/opt/var/spool/cron/crontabs", exist_ok=True)
-    try:
-        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        lines = [l for l in (p.stdout.splitlines() if p.returncode == 0 else []) if "# subkeen_cron" not in l]
-        lines.append(f"0 */{interval} * * * /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py # subkeen_cron")
-        with open("/tmp/cron_subkeen.txt", "w") as f: f.write("\n".join(lines) + "\n")
-        subprocess.run(["crontab", "/tmp/cron_subkeen.txt"], check=True)
-        print(f"Готово. Cron каждые {interval} ч.")
-    except Exception as e:
-        print(f"⚠️ Не удалось настроить cron: {e}")
-
-if __name__ == "__main__": main()
-PYEOF
-chmod +x /opt/sbin/SubKeen-current/subkeen_multi.py
-
-cat > /opt/sbin/choose-servers.py << 'CHOOSE_EOF'
-#!/usr/bin/env python3
-import sys, json, os
-sys.path.insert(0, '/opt/sbin')
-import xkeen_geo
-from urllib.parse import urlparse, unquote
-
-COUNTRY_NAMES = {'RU': 'Россия', 'US': 'США', 'DE': 'Германия', 'NL': 'Нидерланды', 'FI': 'Финляндия', 'SE': 'Швеция', 'TR': 'Турция', 'JP': 'Япония'}
-CONF_FILE = '/opt/etc/xray/subkeen.conf.json'
-
-try:
-    with open(CONF_FILE, 'r', encoding='utf-8') as f: config = json.load(f)
-except Exception as e:
-    print(f"Ошибка чтения конфига: {e}.")
-    sys.exit(1)
-
-url = config['subscription']['url']
-if not url or url == "ВСТАВЬТЕ_СЮДА_ВАШУ_ССЫЛКУ_НА_ПОДПИСКУ":
-    print("Ошибка: URL подписки не настроен")
-    sys.exit(1)
-
-try:
-    urls = xkeen_geo.get_sub(url)
-    if not urls:
-        print("Ошибка: В подписке не найдено серверов vless://")
-        sys.exit(1)
-        
-    geo_data, resolved_data, config = xkeen_geo.get_smart_geo_data(urls, config)
-    servers = []
-    for i, u in enumerate(urls):
-        parsed = urlparse(u)
-        name = unquote(parsed.fragment) if parsed.fragment else f"Server_{i:02d}"
-        hostname = parsed.hostname
-        ip = resolved_data.get(hostname, "N/A")
-        cc = geo_data.get(hostname, "??")
-        cname = COUNTRY_NAMES.get(cc, cc)
-        mark = " [RU-BLOCK]" if cc == 'RU' else ""
-        servers.append((i, name, ip, f"{cc}: {cname}{mark}"))
-    
-    print("Доступные серверы:")
-    for i, name, ip, geo_str in servers: print(f"  [{i:02d}] {name}  [IP: {ip} | {geo_str}]")
-    
-    print("\n" + "="*70)
-    choice = input("1. Номера для ПРИОРИТЕТА или [Enter] авто-выбор: ")
-    print("="*70)
-    if 'priority' not in config: config['priority'] = {}
-    if not choice.strip(): 
-        config['priority']['patterns'] = []
-    else:
-        nums = [int(x.strip()) for x in choice.split(',') if x.strip().isdigit()]
-        safe_patterns = []
-        for i in nums:
-            if isinstance(i, int) and 0 <= i < len(servers):
-                safe_patterns.append(str(servers[i][1]))
-        config['priority']['patterns'] = safe_patterns
-        
-    print("\n" + "="*70)
-    bl = input("2. Номера для ЧЕРНОГО СПИСКА или [Enter] не менять: ")
-    print("="*70)
-    if bl.strip():
-        bl_nums = [int(x.strip()) for x in bl.split(',') if x.strip().isdigit()]
-        if 'exclusions' not in config: config['exclusions'] = {}
-        safe_blacklist = []
-        for n in bl_nums:
-            if isinstance(n, int) and 0 <= n < len(servers):
-                ip_val = servers[n][2]
-                if str(ip_val) != "N/A":
-                    safe_blacklist.append(str(ip_val))
-        config['exclusions']['manual_ip_blacklist'] = safe_blacklist
-        
-    cur = config.get("balancer", {}).get("tolerance", 0.5)
-    cur_pct = int(cur * 100) if isinstance(cur, float) else cur
-    print("\n" + "="*70)
-    tol = input(f"3. Новая разница в % или [Enter] оставить {cur_pct}%: ")
-    print("="*70)
-    if tol.strip():
-        try:
-            nt = int(tol.strip())
-            if 0 <= nt <= 100:
-                if 'balancer' not in config: config['balancer'] = {}
-                config['balancer']['tolerance'] = nt / 100.0
-        except: pass
-        
-    tmp = CONF_FILE + ".tmp"
-    with open(tmp, 'w', encoding='utf-8') as f: json.dump(config, f, indent=2, ensure_ascii=False); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, CONF_FILE)
-    print("Настройки сохранены")
-except Exception as e: print(f"Ошибка: {e}")
-CHOOSE_EOF
-chmod +x /opt/sbin/choose-servers.py
-
-cat > /opt/bin/choose << 'CHOOSE_CMD'
-#!/bin/sh
-/opt/bin/python3 /opt/sbin/choose-servers.py || exit 1
-/opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py || exit 1
-echo "Готово!"
-CHOOSE_CMD
-chmod +x /opt/bin/choose
-
-# [5] INIT-СКРИПТЫ
-echo "[5/6] Настройка правил маршрутизации (iptables)..."
-
-cat > /opt/etc/init.d/S99xray_net << 'S99_EOF'
-#!/bin/sh
-IPT=$(/opt/bin/which iptables 2>/dev/null || /opt/bin/which /opt/sbin/iptables 2>/dev/null)
-if [ -z "$IPT" ]; then echo "ОШИБКА: iptables не найден"; exit 1; fi
-
-get_xray_port() {
-    PORT=$(/opt/bin/python3 -c "
-import json, sys, os, glob
-try:
-    configs_dir = '/opt/etc/xray/configs'
-    inbounds_files = glob.glob(os.path.join(configs_dir, '*inbounds*.json'))
-    for filepath in inbounds_files:
-        with open(filepath) as f: data = json.load(f)
-        for i in data.get('inbounds', []):
-            if i.get('tag') in ['redirect', 'tproxy', 'transparent']:
-                print(i.get('port', 61219)); sys.exit(0)
-except Exception: pass
-print(61219)
-" 2>/dev/null)
-    echo "${PORT:-61219}"
-}
-
-apply_rules() {
-  local count=0
-  while [ $count -lt 40 ]; do
-    if ip route | grep -q "default"; then break; fi
-    sleep 1; count=$((count + 1))
-  done
-  
-  XRAY_PORT=$(get_xray_port)
-  
-  $IPT -t nat -N xkeen 2>/dev/null
-  for i in $(seq 1 10); do $IPT -t nat -D PREROUTING -j xkeen 2>/dev/null || break; done
-  
-  $IPT -t nat -A xkeen -d 127.0.0.0/8 -j RETURN
-  $IPT -t nat -A xkeen -d 192.168.0.0/16 -j RETURN
-  $IPT -t nat -A xkeen -d 10.0.0.0/8 -j RETURN
-  $IPT -t nat -A xkeen -d 172.16.0.0/12 -j RETURN
-  $IPT -t nat -A xkeen -p tcp -j REDIRECT --to-ports $XRAY_PORT
-  $IPT -t nat -I PREROUTING 1 -j xkeen
-  
-  $IPT -D FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || true
-  $IPT -I FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || true
-}
-
-case "$1" in
-  start)
-    if [ "$2" = "force" ]; then apply_rules
-    else ( apply_rules ) & fi
-    ;;
-  stop)
-    for i in $(seq 1 10); do $IPT -t nat -D PREROUTING -j xkeen 2>/dev/null || break; done
-    $IPT -D FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || true
-    $IPT -t nat -F xkeen 2>/dev/null
-    $IPT -t nat -X xkeen 2>/dev/null
-    ;;
-  restart)
-    $0 stop; sleep 2; $0 start "$2"
-    ;;
-  *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
-esac
-S99_EOF
-chmod +x /opt/etc/init.d/S99xray_net
-
-# [6] CONFIG & SUBSCRIPTION + AUTO CHOOSE
-echo "[6/6] Настройка подписки..."
-if [ ! -f /opt/etc/xray/subkeen.conf.json ]; then
-cat > /opt/etc/xray/subkeen.conf.json << 'CONF_EOF'
-{
-  "subscription": {"url": "ВСТАВЬТЕ_СЮДА_ВАШУ_ССЫЛКУ_НА_ПОДПИСКУ", "update_interval_hours": 1},
-  "observatory": {"probeUrl": "http://cp.cloudflare.com/generate_204", "probeInterval": "60s"},
-  "balancer": {"strategy": "leastLoad", "expected": 3, "maxRTT": "2000ms", "tolerance": 0.5},
-  "priority": {"patterns": []},
-  "exclusions": {"by_flag": ["🇷🇺"], "by_name": ["россия", "russia"], "by_hostname": ["msk", "moscow", "cashgruz"], "manual_ip_blacklist": []},
-  "system": {"log_level": "warning", "auto_restart_on_fail": true, "keep_backups": 3}
-}
-CONF_EOF
+if ! verify_install_sha256 "$archive_path" "$url"; then
+    cleanup_runtime
+    exit 1
 fi
 
-echo ""
-echo "Введите HTTPS-ссылку на подписку:"
-read -r SUB_URL || SUB_URL=""
+# 6) Распаковка на накопитель (модули XKeen ~3 МБ). Архив в этот момент
+#    в ОЗУ. При ENOSPC снимаем весь балласт со старой установки и повторяем.
+stage_dir="/opt/sbin/.xkeen-install.$$"
+rm -rf "$stage_dir"
+mkdir -p "$stage_dir"
 
-if [ -n "$SUB_URL" ]; then
-    export SUB_URL
-    /opt/bin/python3 -c "
-import json, os
-with open('/opt/etc/xray/subkeen.conf.json', 'r', encoding='utf-8') as f: cfg = json.load(f)
-cfg['subscription']['url'] = os.environ.get('SUB_URL', '')
-with open('/opt/etc/xray/subkeen.conf.json', 'w', encoding='utf-8') as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
-"
+tar_output=$(tar -xzf "$archive_path" -C "$stage_dir" 2>&1)
+tar_status=$?
+
+if [ "$tar_status" -ne 0 ]; then
+    case "$tar_output" in
+        *[Ss]pace*left*)
+            printf "  ${yellow}Нехватка места${reset} при распаковке: освобождаем накопитель и повторяем\n"
+            rm -rf "$stage_dir" /opt/sbin/.xkeen.old 2>/dev/null
+            rm -f /opt/sbin/xkeen.old 2>/dev/null
+            [ -d /opt/sbin/.xkeen ] && rm -rf /opt/sbin/.xkeen
+            rm -rf /opt/sbin/.xkeen-install.* /opt/sbin/.xkeen.stage.* 2>/dev/null
+            sync
+            mkdir -p "$stage_dir"
+            tar -xzf "$archive_path" -C "$stage_dir" 2>/dev/null
+            ;;
+        *)
+            printf "  ${red}Ошибка${reset} распаковки: %s\n" "$tar_output"
+            ;;
+    esac
 fi
 
-echo ""
-echo "⏳ Выполняем первичную загрузку серверов и генерацию конфигурации..."
-if /opt/bin/python3 /opt/sbin/SubKeen-current/subkeen_multi.py; then
-    echo "✅ Конфигурация успешно сгенерирована."
-    echo "⏳ Запускаем службы Xray и применяем правила маршрутизации..."
-    
-    /opt/bin/xkeen -restart >/dev/null 2>&1 || true
-    /opt/etc/init.d/S99xray_net start force >/dev/null 2>&1 || true
-    
-    echo "🚀 Xray запущен, правила iptables применены."
-    echo ""
-    
-    if [ -t 0 ]; then
-        echo "============================================"
-        echo "  ЗАПУСКАЕМ МАСТЕР НАСТРОЙКИ (choose)"
-        echo "============================================"
-        echo ""
-        /opt/bin/choose
-    else
-        echo "⚠️ Запуск из неинтерактивной среды. Мастер настройки пропущен."
-        echo "   Вы можете настроить серверы позже вручную командой: choose"
-    fi
-else
-    echo "⚠️ Внимание: Первичная настройка завершилась с ошибкой."
-    echo "   Проверьте правильность ссылки на подписку в /opt/etc/xray/subkeen.conf.json"
-    echo "   После исправления ссылки просто выполните команду: choose"
+if [ ! -f "$stage_dir/xkeen" ] || [ ! -d "$stage_dir/_xkeen" ]; then
+    cleanup_runtime
+    printf "  ${red}Ошибка${reset}: не удалось распаковать ${yellow}xkeen.tar.gz${reset}\n"
+    exit 1
 fi
 
-echo ""
-echo "============================================"
-echo "  УСТАНОВКА ЗАВЕРШЕНА!"
-echo "============================================"
-EOF
+# Архив больше не нужен — удаляем сразу после распаковки
+rm -f "$archive_path" 2>/dev/null
+sync
 
-chmod +x /tmp/install.sh
-/tmp/install.sh
+# 7) Перенос в рабочие пути (переименования внутри одного раздела)
+chmod +x "$stage_dir/xkeen"
+if ! mv "$stage_dir/xkeen" /opt/sbin/xkeen.new; then
+    cleanup_runtime
+    printf "  ${red}Ошибка${reset}: после распаковки не найден исполняемый файл ${yellow}/opt/sbin/xkeen${reset}\n"
+    exit 1
+fi
+rm -f /opt/sbin/xkeen.old
+[ -f /opt/sbin/xkeen ] && mv /opt/sbin/xkeen /opt/sbin/xkeen.old
+if ! mv /opt/sbin/xkeen.new /opt/sbin/xkeen; then
+    [ -f /opt/sbin/xkeen.old ] && mv /opt/sbin/xkeen.old /opt/sbin/xkeen
+    cleanup_runtime
+    printf "  ${red}Ошибка${reset}: после распаковки не найден исполняемый файл ${yellow}/opt/sbin/xkeen${reset}\n"
+    exit 1
+fi
+rm -rf /opt/sbin/.xkeen.old
+[ -d /opt/sbin/.xkeen ] && mv /opt/sbin/.xkeen /opt/sbin/.xkeen.old
+if ! mv "$stage_dir/_xkeen" /opt/sbin/.xkeen; then
+    [ -f /opt/sbin/xkeen.old ] && mv /opt/sbin/xkeen.old /opt/sbin/xkeen
+    [ -d /opt/sbin/.xkeen.old ] && mv /opt/sbin/.xkeen.old /opt/sbin/.xkeen
+    cleanup_runtime
+    printf "  ${red}Ошибка${reset}: не удалось установить модули XKeen\n"
+    exit 1
+fi
+rm -f /opt/sbin/xkeen.old
+rm -rf /opt/sbin/.xkeen.old "$stage_dir"
+stage_dir=""
+sync
+
+# 8) Перед самым тяжёлым этапом выгружаем с накопителя необязательное:
+#    кэш opkg, временные каталоги opkg, устаревшие списки пакетов
+#    (xkeen -i всё равно выполнит opkg update и скачает свежие)
+rm -rf /opt/var/cache/opkg/* 2>/dev/null
+rm -rf /opt/tmp/opkg-* 2>/dev/null
+rm -rf /opt/var/opkg-lists/* 2>/dev/null
+sync
+
+# 9) Памятка перед передачей управления штатному установщику
+printf "  ${yellow}Памятка для накопителя малого объёма${reset}\n"
+printf "  В меню установщика:\n"
+printf "    - Mihomo — ${red}откажитесь${reset} (требует ~86 МБ, не поместится)\n"
+printf "    - GeoFile (geoip/geosite, ~20 МБ на накопителе) — откажитесь, если\n"
+printf "      правила geosite:/geoip: не используются; доустановить можно позже\n"
+printf "      повторным запуском ${light_blue}xkeen -i${reset}\n\n"
+printf "  Запуск штатного установщика XKeen...\n\n"
+
+# Временные файлы opkg (.ipk, каталоги распаковки) — в ОЗУ
+export TMPDIR="/tmp"
+
+exec /opt/sbin/xkeen -i
