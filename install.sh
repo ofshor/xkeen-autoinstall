@@ -14,6 +14,10 @@
 #   3. Чистка хвостов прошлых неудачных попыток до начала работы.
 #   4. Fail-fast проверка места + повтор распаковки при ENOSPC.
 #   5. TMPDIR=/tmp для opkg-фазы внутри xkeen -i.
+#   6. Ввод меню читается с /dev/tty: при `curl | sh` stdin занят
+#      самим скриптом, и read «съедал» его строки, ломая парсер.
+#      Финальный exec тоже получает /dev/tty, иначе меню xkeen
+#      зацикливается на EOF пайпа.
 # ============================================================
 
 green="\033[92m"
@@ -65,6 +69,22 @@ cleanup_runtime() {
 trap cleanup_runtime INT TERM
 
 # ---------------------------------------------------------------------------
+# Ввод с терминала, а не со stdin.
+# При `curl ... | sh` stdin скрипта — пайп с текстом скрипта: обычный read
+# «съедает» его строки, парсер рассинхронизируется (syntax error), меню
+# ломается. Читаем с /dev/tty, если stdin — не терминал. Результат — в
+# глобальной REPLY_TTY (без eval — безопасно при любом вводе).
+# ---------------------------------------------------------------------------
+read_from_tty() {
+    REPLY_TTY=""
+    if [ -t 0 ]; then
+        read -r REPLY_TTY
+    elif [ -c /dev/tty ]; then
+        read -r REPLY_TTY < /dev/tty 2>/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Ключевая правка для малого накопителя (см. шапку).
 # Идемпотентно: повторный запуск увидит симлинк и пропустит шаг.
 # Существующее содержимое /opt/tmp переносится в /tmp — там временные
@@ -114,7 +134,7 @@ echo  "    $0 --stable"
 echo  "    $0 --beta"
 echo  "    $0 --legacy 1.1.3.9"
 echo  "    $0 --help"
-echo  "    curl -sSL https://raw.githubusercontent.com/ofshor/xkeen-autoinstall/main/install.sh | sh -s -- --stable"
+echo  "    curl -sSL https://raw.githubusercontent.com/ofshor/xkeen-autoinstall/main/install.sh | tr -d '\r' | sh -s -- --stable"
 }
 
 # Дубль функции из scripts/_xkeen/01_info/01_info_common.sh
@@ -391,7 +411,8 @@ if [ -z "$VERSION_TYPE" ]; then
         printf "  3) Предыдущую версию (${light_blue}Legacy${reset})\n\n"
         printf "  0) Отмена\n\n"
         printf "  Выберите пункт меню [по умолчанию 1]: "
-        read -r version_choice
+        read_from_tty
+        version_choice="$REPLY_TTY"
 
         [ -z "$version_choice" ] && version_choice=1
 
@@ -418,7 +439,8 @@ if [ -z "$VERSION_TYPE" ]; then
                     printf "  ${red}Внимание!${reset}\n  Предыдущие версии могут быть несовместимы с новыми прошивками\n"
                     printf "  Продолжайте только если уверены в том, что делаете\n\n"
                     printf "  Введите интересующую версию XKeen (например, ${light_blue}1.1.3.9${reset} или ${light_blue}0${reset} для выхода): "
-                    read -r legacy_version
+                    read_from_tty
+                    legacy_version="$REPLY_TTY"
 
                     if [ -z "$legacy_version" ]; then
                         printf "  ${red}Ошибка${reset}: версия не может быть пустой.\n\n"
@@ -576,4 +598,14 @@ printf "  Запуск штатного установщика XKeen...\n\n"
 # Временные файлы opkg (.ipk, каталоги распаковки) — в ОЗУ
 export TMPDIR="/tmp"
 
-exec /opt/sbin/xkeen -i
+# Интерактивному установщику нужен живой stdin: при `curl | sh` stdin —
+# пайп с EOF, меню xkeen зациклится. Отдаём ему терминал.
+if [ -t 0 ]; then
+    exec /opt/sbin/xkeen -i
+elif [ -c /dev/tty ]; then
+    exec /opt/sbin/xkeen -i < /dev/tty
+else
+    printf "  ${red}Ошибка${reset}: нет терминала для интерактивной установки\n"
+    printf "  Скачайте скрипт в файл и запустите: sh install.sh --stable\n"
+    exit 1
+fi
